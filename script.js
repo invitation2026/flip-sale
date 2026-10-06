@@ -1,7 +1,12 @@
+// ================================================================
+// Sales Manager · Flipkart + Cashify
+// Dual Firebase integration — Flipkart (default) + Cashify (secondary)
+// ================================================================
+
 // ==========================================
-// FIREBASE CONFIG
+// FIREBASE CONFIG — FLIPKART (default app)
 // ==========================================
-const firebaseConfig = {
+const flipkartConfig = {
     apiKey: "AIzaSyDGJWdgj2GBL-44gXZ9W0mWnOfsczwPXdw",
     authDomain: "mobile-shop-9ea44.firebaseapp.com",
     databaseURL: "https://mobile-shop-9ea44-default-rtdb.firebaseio.com",
@@ -11,15 +16,106 @@ const firebaseConfig = {
     appId: "1:902893829958:web:f2f429ad9290c56f4d6f47",
     measurementId: "G-V4JQT7Z8T9"
 };
-firebase.initializeApp(firebaseConfig);
-const db = firebase.database();
+firebase.initializeApp(flipkartConfig);
+const flipkartDb = firebase.database();
+
+// ==========================================
+// FIREBASE CONFIG — CASHIFY (secondary app)
+// ==========================================
+const cashifyConfig = {
+    apiKey: "AIzaSyD1XNPVJfKzPoNgxo5R33zxOCebH2H613w",
+    authDomain: "cashify-1cea1.firebaseapp.com",
+    databaseURL: "https://cashify-1cea1-default-rtdb.firebaseio.com",
+    projectId: "cashify-1cea1",
+    storageBucket: "cashify-1cea1.firebasestorage.app",
+    messagingSenderId: "141846449557",
+    appId: "1:141846449557:web:8afe3b2c843b1297a3fa9c",
+    measurementId: "G-SNC5ELYPL6"
+};
+const cashifyApp = firebase.initializeApp(cashifyConfig, "cashifyApp");
+const cashifyDb = cashifyApp.database();
+
+// ==========================================
+// SOURCE HELPERS
+// ==========================================
+function getDb(source) {
+    return source === 'cashify' ? cashifyDb : flipkartDb;
+}
+
+function getSourceLabel(source) {
+    return source === 'cashify' ? 'Cashify' : 'Flipkart';
+}
+
+// ==========================================
+// COMMISSION BRACKETS (Flipkart only)
+// ==========================================
+const COMMISSION_BRACKETS = [
+    { min: 0,     max: 10000,    type: 'percentage', value: 10   },
+    { min: 10001, max: 31000,    type: 'percentage', value: 8    },
+    { min: 31001, max: Infinity, type: 'fixed',      value: 2500 }
+];
+
+function calculateCommission(purchasePrice) {
+    if (!purchasePrice || purchasePrice <= 0) return 0;
+    for (const b of COMMISSION_BRACKETS) {
+        if (purchasePrice >= b.min && purchasePrice <= b.max) {
+            if (b.type === 'percentage') {
+                return Math.round((purchasePrice * b.value) / 100);
+            }
+            return b.value;
+        }
+    }
+    return 0;
+}
+
+// ==========================================
+// HELPERS
+// ==========================================
+function getLocalYMD(d = new Date()) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+
+function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    }[c]));
+}
+
+function formatTimeShort(d = new Date()) {
+    return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function refreshIcons() {
+    if (window.lucide) {
+        try { lucide.createIcons(); } catch (e) {}
+    }
+}
 
 // ==========================================
 // STATE
 // ==========================================
+let currentSource = 'flipkart';
 let inventoryList = [];
 let filteredInventory = [];
 let sellOrderData = null;
+let isRefreshing = false;
+
+// Cache: overhead per phone for each source
+const overheadCache = {
+    flipkart: { ts: 0, value: 0 },
+    cashify:  { ts: 0, value: 0 }
+};
+const OVERHEAD_TTL = 10 * 60 * 1000; // 10 minutes
+
+// Last updated timestamp per source
+const lastUpdatedBySource = { flipkart: null, cashify: null };
 
 // ==========================================
 // DOM REFS
@@ -30,6 +126,7 @@ const toastEl = document.getElementById('toast');
 // TOAST
 // ==========================================
 function showToast(msg, type = 'info', duration = 3000) {
+    if (!toastEl) return;
     toastEl.textContent = msg;
     toastEl.className = 'toast-fixed ' + type;
     void toastEl.offsetWidth;
@@ -47,16 +144,15 @@ function setupOfflineDetection() {
         const dot = document.getElementById('statusDot');
         const text = document.getElementById('statusText');
         const container = document.getElementById('connectionStatus');
+        if (!container) return;
         if (isOnline) {
-            container.className =
-                'flex items-center gap-1.5 px-3 py-1 bg-green-50 rounded-full text-xs font-medium text-green-700';
-            dot.className = 'w-2 h-2 bg-green-500 rounded-full pulse-ring';
-            text.textContent = 'Online';
+            container.className = 'hidden sm:flex items-center gap-1.5 px-3 py-1 bg-green-50 rounded-full text-xs font-medium text-green-700';
+            if (dot) dot.className = 'w-2 h-2 bg-green-500 rounded-full pulse-ring';
+            if (text) text.textContent = 'Online';
         } else {
-            container.className =
-                'flex items-center gap-1.5 px-3 py-1 bg-red-50 rounded-full text-xs font-medium text-red-700';
-            dot.className = 'w-2 h-2 bg-red-500 rounded-full';
-            text.textContent = 'Offline';
+            container.className = 'hidden sm:flex items-center gap-1.5 px-3 py-1 bg-red-50 rounded-full text-xs font-medium text-red-700';
+            if (dot) dot.className = 'w-2 h-2 bg-red-500 rounded-full';
+            if (text) text.textContent = 'Offline';
         }
     };
     window.addEventListener('online', updateStatus);
@@ -65,138 +161,366 @@ function setupOfflineDetection() {
 }
 
 // ==========================================
-// LOAD INVENTORY (unsold pickups)
+// SOURCE SWITCHING
+// ==========================================
+function switchSource(source) {
+    if (source !== 'flipkart' && source !== 'cashify') return;
+    if (currentSource === source) return;
+
+    currentSource = source;
+
+    // Update tabs
+    document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.source === source);
+    });
+
+    // Update stat card accents
+    const accentClass = source === 'cashify' ? 'cashify-accent' : 'flipkart-accent';
+    const statStock = document.getElementById('statCardStock');
+    const statSold = document.getElementById('statCardSold');
+    if (statStock) {
+        statStock.classList.remove('flipkart-accent', 'cashify-accent');
+        statStock.classList.add(accentClass);
+    }
+    if (statSold) {
+        statSold.classList.remove('flipkart-accent', 'cashify-accent');
+        statSold.classList.add(accentClass);
+    }
+
+    // Clear search when switching source
+    const searchInput = document.getElementById('inventorySearch');
+    if (searchInput) searchInput.value = '';
+
+    // Reset in-memory lists, reload
+    inventoryList = [];
+    filteredInventory = [];
+    renderInventory();
+
+    loadInventory();
+}
+
+// ==========================================
+// LOAD INVENTORY (unsold pickups for current source)
 // ==========================================
 async function loadInventory() {
+    const db = getDb(currentSource);
+    showToast('🔄 Loading ' + getSourceLabel(currentSource) + ' inventory…', 'info', 1500);
+
     try {
         const snap = await db.ref('pickups').once('value');
         const data = snap.val() || {};
+
         inventoryList = Object.entries(data)
             .filter(([_, item]) => item.status === 'pickup' && !item.sold)
-            .map(([id, item]) => ({ id, ...item }));
-        inventoryList.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            .map(([id, item]) => ({ id, ...item, _source: currentSource }));
+
+        inventoryList.sort((a, b) => {
+            const ta = new Date(a.timestamp || 0).getTime() || 0;
+            const tb = new Date(b.timestamp || 0).getTime() || 0;
+            return tb - ta;
+        });
+
+        lastUpdatedBySource[currentSource] = Date.now();
+
         applySearch();
-        updateStats();
+        updateStats(data);
+        updateLastUpdatedLabel();
     } catch (e) {
-        console.error('Inventory error:', e);
-        showToast('Error loading inventory', 'error');
+        console.error('Inventory load error:', e);
+        showToast('Error loading ' + getSourceLabel(currentSource) + ' inventory', 'error');
+        const tbody = document.getElementById('inventoryTableBody');
+        const cards = document.getElementById('inventoryCards');
+        const errHtml = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Failed to load inventory</p></div>`;
+        if (cards) cards.innerHTML = errHtml;
+        if (tbody) tbody.innerHTML = `<tr><td colspan="7">${errHtml}</td></tr>`;
+        refreshIcons();
     }
 }
 
-function applySearch() {
-    const searchVal = document.getElementById('inventorySearch').value.trim().toLowerCase();
-    let filtered = inventoryList;
-    if (searchVal) {
-        filtered = filtered.filter(item =>
-            (item.orderId || '').toLowerCase().includes(searchVal) ||
-            (item.phoneModel || '').toLowerCase().includes(searchVal)
-        );
-    }
-    filteredInventory = filtered;
-    renderInventory();
-    document.getElementById('inventoryCount').textContent = filteredInventory.length + ' phones';
-}
-
-function clearSearch() {
-    document.getElementById('inventorySearch').value = '';
-    applySearch();
-}
-
-function renderInventory() {
-    const tbody = document.getElementById('inventoryTableBody');
-    if (filteredInventory.length === 0) {
-        tbody.innerHTML =
-            `<tr><td colspan="5"><div class="empty-state"><i data-lucide="inbox"></i><p class="text-sm font-medium">No inventory</p><p class="text-xs text-gray-400">Phones picked up will appear here</p></div></td></tr>`;
-        lucide.createIcons();
+// ==========================================
+// STATS (In Stock + Sold) — from current source
+// ==========================================
+function updateStats(pickupsData) {
+    if (!pickupsData) {
+        // fetch fresh if not provided
+        getDb(currentSource).ref('pickups').once('value').then(snap => {
+            updateStats(snap.val() || {});
+        }).catch(() => {});
         return;
     }
 
+    let soldCount = 0;
+    Object.values(pickupsData).forEach(item => {
+        if (item.sold === true) soldCount++;
+    });
+
+    const elInv = document.getElementById('statInventory');
+    const elSold = document.getElementById('statSold');
+    if (elInv) elInv.textContent = inventoryList.length;
+    if (elSold) elSold.textContent = soldCount;
+}
+
+function updateLastUpdatedLabel() {
+    const el = document.getElementById('lastUpdated');
+    if (!el) return;
+    const ts = lastUpdatedBySource[currentSource];
+    if (!ts) { el.textContent = ''; return; }
+    el.textContent = 'Updated ' + formatTimeShort(new Date(ts));
+}
+
+// ==========================================
+// SEARCH
+// ==========================================
+function applySearch() {
+    const searchInput = document.getElementById('inventorySearch');
+    const raw = (searchInput ? searchInput.value : '').trim().toLowerCase();
+
+    if (!raw) {
+        filteredInventory = [...inventoryList];
+    } else {
+        filteredInventory = inventoryList.filter(item => {
+            const orderId = String(item.orderId || item.id || '').toLowerCase();
+            const model = String(item.phoneModel || '').toLowerCase();
+            const imei = String(item.imei || '').toLowerCase();
+            const imei2 = String(item.imei2 || '').toLowerCase();
+            const cust = String(item.customerName || '').toLowerCase();
+            return orderId.includes(raw)
+                || model.includes(raw)
+                || imei.includes(raw)
+                || imei2.includes(raw)
+                || cust.includes(raw);
+        });
+    }
+
+    renderInventory();
+
+    const countEl = document.getElementById('inventoryCount');
+    if (countEl) {
+        countEl.textContent = filteredInventory.length + ' phone' + (filteredInventory.length === 1 ? '' : 's');
+    }
+}
+
+function clearSearch() {
+    const searchInput = document.getElementById('inventorySearch');
+    if (searchInput) searchInput.value = '';
+    applySearch();
+}
+
+// ==========================================
+// RENDER — Mobile Cards + Desktop Table
+// ==========================================
+function renderInventory() {
+    renderMobileCards();
+    renderDesktopTable();
+    refreshIcons();
+}
+
+function renderMobileCards() {
+    const container = document.getElementById('inventoryCards');
+    if (!container) return;
+
+    if (!filteredInventory.length) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <i data-lucide="inbox"></i>
+                <p class="text-sm font-medium">No inventory</p>
+                <p class="text-xs text-gray-400 mt-1">Phones picked up will appear here</p>
+            </div>
+        `;
+        return;
+    }
+
+    const srcClass = currentSource === 'cashify' ? 'cashify-src' : 'flipkart-src';
+    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
+    const pillLabel = getSourceLabel(currentSource);
+
     let html = '';
-    filteredInventory.forEach((item, idx) => {
+    filteredInventory.forEach(item => {
+        const orderId = escapeHtml(item.orderId || item.id);
+        const model = escapeHtml(item.phoneModel || '—');
+        const imei = escapeHtml(item.imei || '—');
+        const cust = escapeHtml(item.customerName || '—');
+
         html += `
-            <tr class="order-row border-b border-gray-50">
-                <td class="py-3 px-4 text-gray-400 font-mono text-xs">${idx + 1}</td>
-                <td class="py-3 px-4 font-mono font-bold text-gray-800 text-sm">${item.orderId || item.id}</td>
-                <td class="py-3 px-4 text-gray-600 text-sm">${item.phoneModel || '—'}</td>
-                <td class="py-3 px-4 hidden sm:table-cell text-gray-600 text-sm">${item.customerName || '—'}</td>
-                <td class="py-3 px-4">
-                    <button onclick="openSellModal('${item.id}')" class="btn-action sell">
+            <div class="inventory-card ${srcClass}">
+                <div class="flex items-start justify-between gap-2 mb-2 pl-2">
+                    <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-2 flex-wrap mb-1">
+                            <span class="src-pill ${pillClass}"><span class="dot"></span>${pillLabel}</span>
+                        </div>
+                        <div class="font-mono font-bold text-gray-800 text-sm truncate">${orderId}</div>
+                        <div class="text-sm text-gray-700 font-medium truncate mt-0.5">${model}</div>
+                    </div>
+                </div>
+                <div class="pl-2 space-y-1 text-xs text-gray-500">
+                    <div class="flex items-center gap-1.5">
+                        <i data-lucide="hash" class="w-3 h-3 flex-shrink-0"></i>
+                        <span class="font-mono truncate">${imei}</span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                        <i data-lucide="user" class="w-3 h-3 flex-shrink-0"></i>
+                        <span class="truncate">${cust}</span>
+                    </div>
+                </div>
+                <div class="flex gap-2 mt-3 pl-2">
+                    <button onclick="openSellModal('${item.id}')" class="btn-action success flex-1">
                         <i data-lucide="badge-dollar-sign"></i> Sell
                     </button>
                     <button onclick="viewOrderDetail('${item.id}')" class="btn-action view" title="View">
                         <i data-lucide="eye"></i>
                     </button>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+function renderDesktopTable() {
+    const tbody = document.getElementById('inventoryTableBody');
+    if (!tbody) return;
+
+    if (!filteredInventory.length) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="7">
+                    <div class="empty-state">
+                        <i data-lucide="inbox"></i>
+                        <p class="text-sm font-medium">No inventory</p>
+                    </div>
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
+    const pillLabel = getSourceLabel(currentSource);
+
+    let html = '';
+    filteredInventory.forEach((item, idx) => {
+        const orderId = escapeHtml(item.orderId || item.id);
+        const model = escapeHtml(item.phoneModel || '—');
+        const imei = escapeHtml(item.imei || '—');
+        const cust = escapeHtml(item.customerName || '—');
+
+        html += `
+            <tr class="border-b border-gray-50 hover:bg-gray-50 transition">
+                <td class="py-3 px-4 text-gray-400 font-mono text-xs">${idx + 1}</td>
+                <td class="py-3 px-4">
+                    <span class="src-pill ${pillClass}"><span class="dot"></span>${pillLabel}</span>
+                </td>
+                <td class="py-3 px-4 font-mono font-bold text-gray-800 text-sm">${orderId}</td>
+                <td class="py-3 px-4 text-gray-600 text-sm">${model}</td>
+                <td class="py-3 px-4 font-mono text-xs text-gray-500">${imei}</td>
+                <td class="py-3 px-4 text-gray-600 text-sm">${cust}</td>
+                <td class="py-3 px-4">
+                    <div class="flex items-center gap-2">
+                        <button onclick="openSellModal('${item.id}')" class="btn-action success" style="padding:8px 14px;min-height:38px;font-size:12px;">
+                            <i data-lucide="badge-dollar-sign" style="width:16px;height:16px;"></i> Sell
+                        </button>
+                        <button onclick="viewOrderDetail('${item.id}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View">
+                            <i data-lucide="eye" style="width:16px;height:16px;"></i>
+                        </button>
+                    </div>
                 </td>
             </tr>
         `;
     });
+
     tbody.innerHTML = html;
-    lucide.createIcons();
 }
 
 // ==========================================
-// UPDATE STATS (simple counts & revenue)
+// OVERHEAD PER PHONE (used for finalNetProfit)
+// Mirrors the admin panel's loadSales logic.
 // ==========================================
-async function updateStats() {
-    // We still fetch sold count and revenue for the stat cards,
-    // but we hide revenue & profit as per user request? Actually the user said "revenue sold nahin dikhega, total profit nahin".
-    // They only want In Stock and Sold count? But they mentioned "purchases ka price bhi nahin dikhega".
-    // Let's keep only In Stock and Sold count, hide revenue and profit.
-    // We'll just update Inventory count and Sold count.
-    const snap = await db.ref('pickups').once('value');
-    const data = snap.val() || {};
-    let soldCount = 0;
-    let revenue = 0,
-        profit = 0;
-    Object.values(data).forEach(item => {
-        if (item.sold === true) {
-            soldCount++;
-            revenue += item.salePrice || 0;
-            profit += item.profit || 0;
+async function computeOverheadPerPhone(source) {
+    const db = getDb(source);
+
+    const [usersSnap, attendanceSnap, pickupsSnap] = await Promise.all([
+        db.ref('users').once('value'),
+        db.ref('attendance').once('value'),
+        db.ref('pickups').once('value')
+    ]);
+
+    const users = usersSnap.val() || {};
+    const attendance = attendanceSnap.val() || {};
+    const pickups = pickupsSnap.val() || {};
+
+    const today = new Date();
+    let totalOverhead = 0;
+
+    // 1) Base salary overhead — per agent, per present day
+    for (const [uname, uData] of Object.entries(users)) {
+        const role = uData.role || 'agent';
+        if (role !== 'agent') continue;
+
+        const monthlySalary = Number(uData.salary) || 0;
+        if (monthlySalary <= 0) continue;
+        const perDaySalary = monthlySalary / 30;
+
+        let joinDate = null;
+        if (uData.joinDate) joinDate = new Date(uData.joinDate + 'T00:00:00');
+        else if (uData.createdAt) joinDate = new Date(uData.createdAt);
+        if (!joinDate || isNaN(joinDate)) joinDate = new Date(today);
+
+        let cur = new Date(joinDate);
+        while (cur <= today) {
+            const ds = getLocalYMD(cur);
+            const att = (attendance[uname] && attendance[uname][ds]) || {};
+            const isPresent = att.status === 'present';
+            const salaryCounted = att.salary_counted !== false;
+            if (isPresent && salaryCounted) {
+                totalOverhead += (att.half_day === true) ? perDaySalary * 0.5 : perDaySalary;
+            }
+            cur.setDate(cur.getDate() + 1);
+        }
+    }
+
+    // 2) Add pickup + approved-reject incentives for agents
+    let totalPickupIncentives = 0;
+    let totalRejectIncentives = 0;
+
+    Object.values(pickups).forEach(item => {
+        if (!item || item.status === 'on_hold') return;
+        const agent = item.agent;
+        if (!agent) return;
+        const uData = users[agent];
+        if (!uData || (uData.role || 'agent') !== 'agent') return;
+
+        if (item.status === 'pickup') {
+            totalPickupIncentives += Number(uData.pickup_incentive) || 0;
+        } else if (item.status === 'rejected' && Boolean(item.incentive_approved)) {
+            totalRejectIncentives += Number(uData.reject_incentive) || 0;
         }
     });
-    document.getElementById('statInventory').textContent = inventoryList.length;
-    document.getElementById('statSold').textContent = soldCount;
-    // Still show revenue and profit? The user explicitly said "nahin dikhega". So we should hide those cards.
-    // Instead of hiding, we can remove them from HTML. But we'll keep them hidden with CSS or remove them.
-    // For simplicity, we'll set text to empty and hide the cards.
-    // Better: remove the cards from HTML. But we already have them in the layout. We'll hide them with display:none.
-    document.getElementById('statRevenue').parentElement.parentElement.style.display = 'none';
-    document.getElementById('statProfit').parentElement.parentElement.style.display = 'none';
-    // Also remove the grid columns: we have 4 cards, but we'll only show 2. We'll adjust grid to 2 columns.
-    // We'll dynamically hide the revenue and profit cards.
-    // Already we have grid-cols-1 sm:grid-cols-4; we'll change to sm:grid-cols-2.
-    // But we already have the HTML with 4 cards. We'll just hide the last two.
-    // Let's just hide them via JS after page load.
+
+    totalOverhead += totalPickupIncentives + totalRejectIncentives;
+
+    // 3) Divide by total sold count
+    let totalSold = 0;
+    Object.values(pickups).forEach(item => {
+        if (item && item.status === 'pickup' && item.sold) totalSold++;
+    });
+
+    return totalSold > 0 ? totalOverhead / totalSold : 0;
 }
 
-// Hide revenue and profit cards on load
-document.addEventListener('DOMContentLoaded', () => {
-    // The stats cards are in the grid. We'll hide revenue and profit by removing them.
-    // But we already have them in the HTML. We'll set display:none via JS after DOM ready.
-    const revenueCard = document.getElementById('statRevenue').closest('.stat-card');
-    const profitCard = document.getElementById('statProfit').closest('.stat-card');
-    if (revenueCard) revenueCard.style.display = 'none';
-    if (profitCard) profitCard.style.display = 'none';
-    // Adjust grid to 2 columns
-    const statsGrid = document.querySelector('.grid.grid-cols-1.sm\\:grid-cols-4');
-    if (statsGrid) {
-        statsGrid.className = 'grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6';
+async function getOverheadPerPhone(source, force = false) {
+    const cached = overheadCache[source];
+    if (!force && cached && cached.value > 0 && (Date.now() - cached.ts < OVERHEAD_TTL)) {
+        return cached.value;
     }
-});
-
-// Override updateStats to not show revenue/profit
-function updateStats() {
-    // Just update inventory and sold counts
-    const snap = db.ref('pickups').once('value').then(snap => {
-        const data = snap.val() || {};
-        let soldCount = 0;
-        Object.values(data).forEach(item => {
-            if (item.sold === true) soldCount++;
-        });
-        document.getElementById('statInventory').textContent = inventoryList.length;
-        document.getElementById('statSold').textContent = soldCount;
-    });
+    try {
+        const value = await computeOverheadPerPhone(source);
+        overheadCache[source] = { ts: Date.now(), value };
+        return value;
+    } catch (e) {
+        console.warn('Overhead calc failed:', e);
+        return cached ? cached.value : 0;
+    }
 }
 
 // ==========================================
@@ -208,54 +532,113 @@ function openSellModal(orderId) {
         showToast('Order not found in inventory', 'error');
         return;
     }
+
     sellOrderData = order;
+
     document.getElementById('sellOrderId').value = order.orderId || order.id;
     document.getElementById('sellModel').value = order.phoneModel || '—';
+    document.getElementById('sellImei').value = order.imei || '—';
     document.getElementById('sellCustomer').value = order.customerName || '—';
     document.getElementById('sellSalePrice').value = '';
     document.getElementById('sellBuyerName').value = '';
     document.getElementById('sellBuyerContact').value = '';
-    // Default date: today
-    const today = new Date().toISOString().split('T')[0];
-    document.getElementById('sellSaleDate').value = today;
-    document.getElementById('sellModal').style.display = 'flex';
-    lucide.createIcons();
-    // Focus on sale price
-    setTimeout(() => document.getElementById('sellSalePrice').focus(), 300);
+    document.getElementById('sellSaleDate').value = getLocalYMD();
+
+    // Update source banner
+    const banner = document.getElementById('sellSourceBanner');
+    if (banner) {
+        if (currentSource === 'cashify') {
+            banner.style.background = '#E6FAF6';
+            banner.style.color = '#0FA88B';
+            banner.style.border = '1px solid #a7f3d0';
+            banner.innerHTML = `
+                <span style="display:flex;align-items:center;gap:8px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#12CAA7;display:inline-block;"></span>
+                    Selling from Cashify
+                </span>
+                <span>CASHIFY</span>
+            `;
+        } else {
+            banner.style.background = '#eef2ff';
+            banner.style.color = '#4338ca';
+            banner.style.border = '1px solid #c7d2fe';
+            banner.innerHTML = `
+                <span style="display:flex;align-items:center;gap:8px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#6366f1;display:inline-block;"></span>
+                    Selling from Flipkart
+                </span>
+                <span>FLIPKART</span>
+            `;
+        }
+    }
+
+    const modal = document.getElementById('sellModal');
+    if (modal) modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+
+    refreshIcons();
+
+    setTimeout(() => {
+        const inp = document.getElementById('sellSalePrice');
+        if (inp) inp.focus();
+    }, 300);
 }
 
 function closeSellModal() {
-    document.getElementById('sellModal').style.display = 'none';
+    const modal = document.getElementById('sellModal');
+    if (modal) modal.style.display = 'none';
+    document.body.style.overflow = '';
     sellOrderData = null;
 }
 
+// ==========================================
+// CONFIRM SELL — writes to correct Firebase
+// ==========================================
 async function confirmSell() {
     if (!sellOrderData) return;
 
-    const salePrice = parseFloat(document.getElementById('sellSalePrice').value);
+    const salePriceRaw = document.getElementById('sellSalePrice').value.trim();
     const buyerName = document.getElementById('sellBuyerName').value.trim();
     const buyerContact = document.getElementById('sellBuyerContact').value.trim();
-    const saleDate = document.getElementById('sellSaleDate').value;
+    const saleDate = document.getElementById('sellSaleDate').value || getLocalYMD();
 
-    if (!salePrice || salePrice <= 0) {
+    const salePrice = parseFloat(salePriceRaw);
+
+    if (!salePrice || salePrice <= 0 || isNaN(salePrice)) {
         showToast('Please enter a valid sale price', 'error');
+        const inp = document.getElementById('sellSalePrice');
+        if (inp) inp.focus();
         return;
     }
     if (!buyerName) {
         showToast('Please enter buyer name', 'error');
+        const inp = document.getElementById('sellBuyerName');
+        if (inp) inp.focus();
         return;
     }
 
-    // Confirm
+    const order = sellOrderData;
+    const source = currentSource;
+    const sourceLabel = getSourceLabel(source);
+
+    // ------- Build confirm dialog info -------
     const confirm = await Swal.fire({
         title: 'Confirm Sale',
         html: `
-            <div class="text-left space-y-1 text-sm">
-                <p><strong>Order:</strong> ${sellOrderData.orderId}</p>
-                <p><strong>Model:</strong> ${sellOrderData.phoneModel}</p>
-                <p><strong>Sale Price:</strong> ₹${salePrice}</p>
-                <p><strong>Buyer:</strong> ${buyerName}</p>
-                <p><strong>Sale Date:</strong> ${saleDate}</p>
+            <div style="text-align:left;font-size:14px;line-height:1.7;">
+                <div style="margin-bottom:6px;">
+                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;
+                        background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};
+                        color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};
+                        border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">
+                        ${sourceLabel.toUpperCase()}
+                    </span>
+                </div>
+                <p><strong>Order:</strong> ${escapeHtml(order.orderId || order.id)}</p>
+                <p><strong>Model:</strong> ${escapeHtml(order.phoneModel || '—')}</p>
+                <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
+                <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
+                <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
             </div>
         `,
         icon: 'question',
@@ -265,10 +648,23 @@ async function confirmSell() {
         confirmButtonText: '✅ Confirm Sale',
         cancelButtonText: 'Cancel'
     });
+
     if (!confirm.isConfirmed) return;
 
+    // ------- Disable confirm button while saving -------
+    const confirmBtn = document.getElementById('confirmSellBtn');
+    const originalBtnHtml = confirmBtn ? confirmBtn.innerHTML : '';
+    if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Saving…';
+    }
+
     try {
-        const updates = {
+        // ------- Compute profit per source -------
+        const overhead = await getOverheadPerPhone(source, false);
+        const purchase = Number(order.value) || 0;
+
+        let writePayload = {
             sold: true,
             salePrice: salePrice,
             buyerName: buyerName,
@@ -276,92 +672,217 @@ async function confirmSell() {
             saleDate: saleDate,
             saleTimestamp: new Date().toISOString()
         };
-        await db.ref('pickups/' + sellOrderData.id).update(updates);
-        showToast(`✅ Sold for ₹${salePrice}`, 'success');
+
+        if (source === 'flipkart') {
+            // Flipkart: purchase + commission + grossProfit + finalNetProfit
+            const commission = calculateCommission(purchase);
+            const grossProfit = salePrice - purchase - commission;
+            const finalProfit = grossProfit - overhead;
+
+            writePayload.commission = commission;
+            writePayload.grossProfit = grossProfit;
+            writePayload.finalNetProfit = finalProfit;
+            writePayload.profit = grossProfit; // match admin panel style
+        } else {
+            // Cashify: actual cost = value + coinTotalValue
+            const coins = Number(order.coins) || 0;
+            const rate = Number(order.coinValueRate) || 12.5;
+            const coinsValue = (order.coinTotalValue !== undefined && order.coinTotalValue !== null)
+                ? Number(order.coinTotalValue)
+                : coins * rate;
+            const actualCost = (order.actualTotalCost !== undefined && order.actualTotalCost !== null)
+                ? Number(order.actualTotalCost)
+                : purchase + coinsValue;
+
+            const grossProfit = salePrice - actualCost;
+            const finalProfit = grossProfit - overhead;
+
+            writePayload.grossProfit = grossProfit;
+            writePayload.finalNetProfit = finalProfit;
+        }
+
+        // ------- Write to correct Firebase -------
+        const db = getDb(source);
+        await db.ref('pickups/' + order.id).update(writePayload);
+
+        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
 
         closeSellModal();
+
+        // ------- Reload current inventory + stats -------
         await loadInventory();
-        updateStats();
 
     } catch (e) {
         console.error('Sale error:', e);
-        showToast('Error saving sale', 'error');
+        showToast('Error saving sale. Please try again.', 'error');
+    } finally {
+        if (confirmBtn) {
+            confirmBtn.disabled = false;
+            confirmBtn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle" class="w-4 h-4"></i> Confirm Sale';
+            refreshIcons();
+        }
     }
 }
 
 // ==========================================
-// VIEW ORDER DETAIL (with IMEI visible)
+// VIEW ORDER DETAIL
 // ==========================================
-function viewOrderDetail(orderId) {
+async function viewOrderDetail(orderId) {
     const modal = document.getElementById('detailModal');
     const content = document.getElementById('detailContent');
-    modal.style.display = 'flex';
-    content.innerHTML = `<div class="text-center py-8"><span class="spinner-sm"></span><p class="text-sm text-gray-400 mt-2">Loading...</p></div>`;
+    if (!modal || !content) return;
 
-    db.ref('pickups/' + orderId).once('value').then(snap => {
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+    content.innerHTML = `<div class="text-center py-8 text-gray-400"><span class="spinner-sm"></span><p class="text-sm mt-2">Loading...</p></div>`;
+
+    try {
+        const db = getDb(currentSource);
+        const snap = await db.ref('pickups/' + orderId).once('value');
         const item = snap.val();
+
         if (!item) {
-            content.innerHTML =
-                `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium">Order not found</p></div>`;
+            content.innerHTML = `
+                <div class="empty-state">
+                    <i data-lucide="alert-circle"></i>
+                    <p class="text-sm font-medium">Order not found</p>
+                </div>
+            `;
+            refreshIcons();
             return;
         }
 
         const statusLabel = item.status || 'unknown';
         const isSold = item.sold === true;
-        const statusDisplay = isSold ? 'Sold' :
-            statusLabel === 'pickup' ? 'Pickup' :
-            statusLabel === 'rejected' ? 'Rejected' : 'Pending';
-        const statusClass = isSold ? 'sold' :
-            statusLabel === 'pickup' ? 'available' :
-            statusLabel === 'rejected' ? 'rejected' : 'reschedule';
+
+        const statusDisplay = isSold ? 'Sold'
+            : statusLabel === 'pickup' ? 'Pickup'
+            : statusLabel === 'rejected' ? 'Rejected'
+            : 'Pending';
+
+        const statusClass = isSold ? 'sold'
+            : statusLabel === 'pickup' ? 'available'
+            : 'rejected';
+
+        const sourceLabel = getSourceLabel(currentSource);
+        const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
 
         let saleHtml = '';
         if (isSold) {
             saleHtml = `
-                <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${item.salePrice || 0}</div></div>
-                <div class="detail-item"><div class="label">Buyer</div><div class="value">${item.buyerName || '—'}</div></div>
-                <div class="detail-item"><div class="label">Buyer Contact</div><div class="value">${item.buyerContact || '—'}</div></div>
-                <div class="detail-item"><div class="label">Sale Date</div><div class="value">${item.saleDate || '—'}</div></div>
+                <div class="detail-item">
+                    <div class="label">Sale Price</div>
+                    <div class="value">₹${Number(item.salePrice || 0).toLocaleString('en-IN')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Buyer</div>
+                    <div class="value">${escapeHtml(item.buyerName || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Buyer Contact</div>
+                    <div class="value">${escapeHtml(item.buyerContact || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Sale Date</div>
+                    <div class="value">${escapeHtml(item.saleDate || '—')}</div>
+                </div>
             `;
         }
 
-        let html = `
-            <div class="flex items-center gap-3 mb-4">
+        const ramStorage = item.ramStorage
+            ? escapeHtml(item.ramStorage)
+            : (item.ram && item.storage ? escapeHtml(item.ram + ' / ' + item.storage) : '—');
+
+        const html = `
+            <div class="flex items-center gap-2 flex-wrap mb-4">
                 <span class="badge-status ${statusClass} text-sm px-4 py-1.5">${statusDisplay}</span>
-                <span class="font-mono font-bold text-gray-800 text-sm">${item.orderId || orderId}</span>
+                <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
+                <span class="font-mono font-bold text-gray-800 text-sm">${escapeHtml(item.orderId || orderId)}</span>
             </div>
+
             <div class="detail-grid">
-                <div class="detail-item"><div class="label">Phone Model</div><div class="value">${item.phoneModel || '—'}</div></div>
-                <div class="detail-item"><div class="label">IMEI</div><div class="value font-mono text-xs">${item.imei || '—'}</div></div>
-                ${item.imei2 ? `<div class="detail-item"><div class="label">IMEI 2</div><div class="value font-mono text-xs">${item.imei2}</div></div>` : ''}
-                <div class="detail-item"><div class="label">Purchase Price</div><div class="value">₹${item.value || 0}</div></div>
-                <div class="detail-item"><div class="label">Customer</div><div class="value">${item.customerName || '—'}</div></div>
-                <div class="detail-item"><div class="label">Reason</div><div class="value">${item.reason || '—'}</div></div>
-                <div class="detail-item"><div class="label">Time (IST)</div><div class="value text-xs">${item.timestampIST || item.timestamp || '—'}</div></div>
+                <div class="detail-item">
+                    <div class="label">Phone Model</div>
+                    <div class="value">${escapeHtml(item.phoneModel || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">IMEI</div>
+                    <div class="value font-mono text-xs">${escapeHtml(item.imei || '—')}</div>
+                </div>
+                ${item.imei2 ? `
+                    <div class="detail-item">
+                        <div class="label">IMEI 2</div>
+                        <div class="value font-mono text-xs">${escapeHtml(item.imei2)}</div>
+                    </div>
+                ` : ''}
+                <div class="detail-item">
+                    <div class="label">RAM / Storage</div>
+                    <div class="value">${ramStorage}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Network</div>
+                    <div class="value">${escapeHtml(item.networkType || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Customer</div>
+                    <div class="value">${escapeHtml(item.customerName || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Reason</div>
+                    <div class="value">${escapeHtml(item.reason || '—')}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Time (IST)</div>
+                    <div class="value text-xs">${escapeHtml(item.timestampIST || item.timestamp || '—')}</div>
+                </div>
+                ${item.agent ? `
+                    <div class="detail-item">
+                        <div class="label">Agent</div>
+                        <div class="value">${escapeHtml(item.agent)}</div>
+                    </div>
+                ` : ''}
                 ${saleHtml}
             </div>
         `;
+
         content.innerHTML = html;
-        lucide.createIcons();
-    }).catch(err => {
-        content.innerHTML =
-            `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Error loading details</p></div>`;
-        showToast('Error loading details', 'error');
-    });
+        refreshIcons();
+
+    } catch (err) {
+        console.error('Detail load error:', err);
+        content.innerHTML = `
+            <div class="empty-state">
+                <i data-lucide="alert-circle"></i>
+                <p class="text-sm font-medium text-red-500">Error loading details</p>
+            </div>
+        `;
+        refreshIcons();
+        showToast('Error loading order details', 'error');
+    }
 }
 
 function closeDetailModal() {
-    document.getElementById('detailModal').style.display = 'none';
+    const modal = document.getElementById('detailModal');
+    if (modal) modal.style.display = 'none';
+    document.body.style.overflow = '';
 }
 
 // ==========================================
 // REFRESH
 // ==========================================
 async function refreshInventory() {
-    showToast('🔄 Refreshing...', 'info');
+    if (isRefreshing) return;
+    isRefreshing = true;
+
+    showToast('🔄 Refreshing…', 'info', 1200);
+
+    // Force fresh overhead on next sale
+    overheadCache[currentSource] = { ts: 0, value: 0 };
+
     await loadInventory();
-    await updateStats();
-    showToast('✅ Refreshed', 'success');
+
+    isRefreshing = false;
+    showToast('✅ Refreshed', 'success', 1500);
 }
 
 // ==========================================
@@ -369,48 +890,59 @@ async function refreshInventory() {
 // ==========================================
 document.addEventListener('DOMContentLoaded', () => {
     setupOfflineDetection();
-    lucide.createIcons();
+    refreshIcons();
 
-    // Hide revenue and profit cards
-    document.querySelectorAll('.stat-card').forEach((card, index) => {
-        if (index >= 2) { // revenue and profit are index 2 and 3
-            card.style.display = 'none';
-        }
+    // Ensure source tabs state is consistent with currentSource
+    document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.source === currentSource);
     });
-    // Adjust grid columns
-    const grid = document.querySelector('.grid.grid-cols-1.sm\\:grid-cols-4');
-    if (grid) {
-        grid.className = 'grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6';
-    }
 
+    // Initial load
     loadInventory();
-    updateStats();
 
     // Auto-refresh every 60 seconds
     setInterval(() => {
+        if (document.hidden) return;
         loadInventory();
-        updateStats();
     }, 60000);
 
-    console.log('✅ Sales Manager (simple) ready');
-    showToast('👋 Welcome to Sales Manager', 'info', 2000);
+    showToast('👋 Sales Manager ready', 'info', 2000);
+    console.log('✅ Sales Manager (dual-source) initialized');
 });
 
-// Click outside modals to close
-document.getElementById('sellModal').addEventListener('click', function(e) {
-    if (e.target === this) closeSellModal();
-});
-document.getElementById('detailModal').addEventListener('click', function(e) {
-    if (e.target === this) closeDetailModal();
-});
+// ==========================================
+// MODAL OUTSIDE-CLICK + ESC
+// ==========================================
+const sellModalEl = document.getElementById('sellModal');
+if (sellModalEl) {
+    sellModalEl.addEventListener('click', function (e) {
+        if (e.target === this) closeSellModal();
+    });
+}
 
-// ESC key
-document.addEventListener('keydown', function(e) {
+const detailModalEl = document.getElementById('detailModal');
+if (detailModalEl) {
+    detailModalEl.addEventListener('click', function (e) {
+        if (e.target === this) closeDetailModal();
+    });
+}
+
+document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') {
         closeSellModal();
         closeDetailModal();
     }
 });
 
-// Re-render icons after dynamic content
-setInterval(() => lucide.createIcons(), 3000);
+// ==========================================
+// EXPOSE FOR INLINE HANDLERS
+// ==========================================
+window.switchSource = switchSource;
+window.applySearch = applySearch;
+window.clearSearch = clearSearch;
+window.openSellModal = openSellModal;
+window.closeSellModal = closeSellModal;
+window.confirmSell = confirmSell;
+window.viewOrderDetail = viewOrderDetail;
+window.closeDetailModal = closeDetailModal;
+window.refreshInventory = refreshInventory;

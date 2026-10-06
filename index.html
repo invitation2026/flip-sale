@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <meta name="theme-color" content="#0f172a" />
-    <title>Sales Manager · Flipkart</title>
+    <title>Sales Manager · Flipkart &amp; Cashify</title>
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
@@ -13,10 +13,7 @@
     <script src="https://unpkg.com/lucide@latest"></script>
 
     <style>
-        * {
-            -webkit-tap-highlight-color: transparent;
-            box-sizing: border-box;
-        }
+        * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
         html { scroll-behavior: smooth; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -27,18 +24,109 @@
         }
 
         .glass {
-            background: rgba(255, 255, 255, 0.9);
+            background: rgba(255, 255, 255, 0.92);
             backdrop-filter: blur(16px);
             -webkit-backdrop-filter: blur(16px);
         }
 
+        /* ============ HEADER ============ */
+        .app-header {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid #e2e8f0;
+        }
+        .app-header::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 45%, #12CAA7 55%, #0FA88B 100%);
+        }
+
+        /* ============ SOURCE TABS ============ */
+        .source-tabs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            padding: 6px;
+            background: #fff;
+            border-radius: 18px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+        .source-tab {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 12px 14px;
+            border-radius: 13px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 14px;
+            color: #64748b;
+            transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+            font-family: inherit;
+            letter-spacing: 0.1px;
+            white-space: nowrap;
+        }
+        .source-tab .brand-dot {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            transition: all 0.22s;
+            box-shadow: 0 0 0 0 transparent;
+        }
+        .source-tab[data-source="flipkart"] .brand-dot {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        }
+        .source-tab[data-source="cashify"] .brand-dot {
+            background: linear-gradient(135deg, #12CAA7, #0FA88B);
+        }
+        .source-tab:not(.active):hover { background: #f8fafc; color: #334155; }
+        .source-tab.active {
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+        }
+        .source-tab.active .brand-dot {
+            background: #fff !important;
+            box-shadow: 0 0 0 3px rgba(255,255,255,0.35);
+        }
+        .source-tab[data-source="flipkart"].active {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        }
+        .source-tab[data-source="cashify"].active {
+            background: linear-gradient(135deg, #12CAA7, #0FA88B);
+        }
+
+        /* ============ STAT CARDS ============ */
         .stat-card {
             transition: transform 0.15s;
             border: 1px solid #e2e8f0;
             background: #fff;
+            position: relative;
+            overflow: hidden;
         }
         .stat-card:active { transform: scale(0.98); }
+        .stat-card.flipkart-accent::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, #6366f1, #8b5cf6);
+        }
+        .stat-card.cashify-accent::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, #12CAA7, #0FA88B);
+        }
 
+        /* ============ BADGES ============ */
         .badge-status {
             padding: 3px 12px;
             border-radius: 20px;
@@ -50,6 +138,7 @@
         .badge-status.available { background: #d1fae5; color: #065f46; }
         .badge-status.sold { background: #dbeafe; color: #1e40af; }
 
+        /* ============ BUTTONS ============ */
         .btn-action {
             padding: 10px 16px;
             border-radius: 12px;
@@ -57,32 +146,38 @@
             font-weight: 600;
             border: none;
             cursor: pointer;
-            transition: transform 0.1s;
+            transition: transform 0.1s, opacity 0.15s;
             display: inline-flex;
             align-items: center;
             justify-content: center;
             gap: 6px;
             min-height: 44px;
+            font-family: inherit;
         }
         .btn-action:active { transform: scale(0.96); }
+        .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-action i { width: 18px; height: 18px; }
-
-        .btn-action.sell { background: #dbeafe; color: #1e40af; }
-        .btn-action.view { background: #eef2ff; color: #4f46e5; }
+        .btn-action.sell { background: #eef2ff; color: #4f46e5; }
+        .btn-action.sell:hover { background: #e0e7ff; }
+        .btn-action.view { background: #f1f5f9; color: #475569; }
+        .btn-action.view:hover { background: #e2e8f0; }
         .btn-action.refresh { background: #f1f5f9; color: #475569; }
         .btn-action.primary { background: #4f46e5; color: #fff; }
         .btn-action.success { background: #059669; color: #fff; }
+        .btn-action.success:hover { background: #047857; }
 
+        /* ============ INPUTS ============ */
         .input-field {
             border: 2px solid #e2e8f0;
             border-radius: 12px;
             padding: 12px 14px;
             width: 100%;
-            font-size: 16px; /* prevents iOS zoom */
+            font-size: 16px;
             outline: none;
             transition: border 0.2s, box-shadow 0.2s;
             background: #fff;
             min-height: 48px;
+            font-family: inherit;
         }
         .input-field:focus {
             border-color: #4f46e5;
@@ -91,25 +186,29 @@
         .input-field:disabled, .input-field[readonly] {
             background: #f1f5f9;
             cursor: not-allowed;
+            color: #475569;
         }
 
+        /* ============ ANIMATIONS ============ */
         .fade-in { animation: fadeIn 0.3s ease; }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(8px); }
             to { opacity: 1; transform: translateY(0); }
         }
-
         .slide-up { animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
         @keyframes slideUp {
             from { opacity: 0; transform: translateY(30px); }
             to { opacity: 1; transform: translateY(0); }
         }
 
+        /* ============ MODAL ============ */
         .modal-overlay {
             backdrop-filter: blur(6px);
-            background: rgba(15, 23, 42, 0.5);
+            -webkit-backdrop-filter: blur(6px);
+            background: rgba(15, 23, 42, 0.55);
         }
 
+        /* ============ SPINNER ============ */
         .spinner-sm {
             border: 2px solid #e2e8f0;
             border-top: 2px solid #4f46e5;
@@ -123,22 +222,24 @@
             100% { transform: rotate(360deg); }
         }
 
+        /* ============ EMPTY STATE ============ */
         .empty-state {
             text-align: center;
-            padding: 40px 20px;
+            padding: 48px 20px;
             color: #94a3b8;
         }
         .empty-state i {
-            width: 44px; height: 44px;
-            margin-bottom: 10px;
+            width: 46px; height: 46px;
+            margin-bottom: 12px;
             color: #cbd5e1;
         }
 
+        /* ============ TOAST ============ */
         .toast-fixed {
             position: fixed;
             bottom: 20px;
             left: 50%;
-            transform: translateX(-50%);
+            transform: translateX(-50%) translateY(20px);
             background: #0f172a;
             color: #fff;
             padding: 12px 24px;
@@ -146,10 +247,9 @@
             font-weight: 600;
             font-size: 14px;
             box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-            z-index: 999;
+            z-index: 9999;
             opacity: 0;
             transition: opacity 0.3s, transform 0.3s;
-            transform: translateX(-50%) translateY(20px);
             pointer-events: none;
             max-width: 90%;
             text-align: center;
@@ -163,6 +263,7 @@
         .toast-fixed.error { background: #991b1b; }
         .toast-fixed.info { background: #1e40af; }
 
+        /* ============ PULSE ============ */
         .pulse-ring {
             animation: pulseRing 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
         }
@@ -172,17 +273,33 @@
             100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
         }
 
-        /* Inventory card (mobile) */
+        /* ============ INVENTORY CARD (Mobile) ============ */
         .inventory-card {
             background: #fff;
             border: 1px solid #e2e8f0;
             border-radius: 16px;
             padding: 14px;
-            transition: transform 0.15s;
+            transition: transform 0.15s, box-shadow 0.15s;
+            position: relative;
+            overflow: hidden;
         }
         .inventory-card:active { transform: scale(0.99); }
+        .inventory-card.flipkart-src::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; bottom: 0;
+            width: 3px;
+            background: linear-gradient(180deg, #6366f1, #8b5cf6);
+        }
+        .inventory-card.cashify-src::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; bottom: 0;
+            width: 3px;
+            background: linear-gradient(180deg, #12CAA7, #0FA88B);
+        }
 
-        /* Sell Modal */
+        /* ============ SELL MODAL ============ */
         .sell-modal .field-group { margin-bottom: 14px; }
         .sell-modal label {
             font-size: 13px;
@@ -198,20 +315,23 @@
             border-radius: 12px;
             font-size: 16px;
             outline: none;
-            transition: border 0.2s;
+            transition: border 0.2s, box-shadow 0.2s;
             background: #fff;
             min-height: 48px;
+            font-family: inherit;
         }
         .sell-modal input:focus {
             border-color: #4f46e5;
             box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
         }
-        .sell-modal input:disabled {
+        .sell-modal input:disabled,
+        .sell-modal input[readonly] {
             background: #f1f5f9;
             cursor: not-allowed;
+            color: #475569;
         }
 
-        /* Detail Modal */
+        /* ============ DETAIL GRID ============ */
         .detail-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -238,7 +358,7 @@
             margin-top: 2px;
         }
 
-        /* Mobile-first modal: bottom sheet on mobile, centered on desktop */
+        /* ============ MOBILE MODAL ============ */
         .mobile-modal {
             background: #fff;
             border-radius: 24px 24px 0 0;
@@ -247,12 +367,8 @@
             overflow-y: auto;
             -webkit-overflow-scrolling: touch;
         }
+        .mobile-modal::-webkit-scrollbar { width: 0; }
 
-        /* Hide scrollbar */
-        ::-webkit-scrollbar { width: 0; height: 0; }
-        * { scrollbar-width: none; }
-
-        /* Desktop: centered modal */
         @media (min-width: 768px) {
             .mobile-modal {
                 border-radius: 24px;
@@ -260,44 +376,90 @@
                 max-height: 90vh;
             }
         }
+
+        /* ============ SCROLLBAR HIDE ============ */
+        ::-webkit-scrollbar { width: 0; height: 0; }
+        * { scrollbar-width: none; }
+
+        /* ============ SOURCE PILL BADGE ============ */
+        .src-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+        }
+        .src-pill.flipkart {
+            background: #eef2ff;
+            color: #4338ca;
+            border: 1px solid #c7d2fe;
+        }
+        .src-pill.cashify {
+            background: #E6FAF6;
+            color: #0FA88B;
+            border: 1px solid #a7f3d0;
+        }
+        .src-pill .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+        .src-pill.flipkart .dot { background: #6366f1; }
+        .src-pill.cashify .dot { background: #12CAA7; }
     </style>
 </head>
 <body>
 
-    <!-- Toast -->
+    <!-- ============ TOAST ============ -->
     <div id="toast" class="toast-fixed"></div>
 
-    <!-- ====== MAIN APP ====== -->
+    <!-- ============ MAIN APP ============ -->
     <div class="max-w-6xl mx-auto px-3 sm:px-6 py-4 sm:py-8">
 
-        <!-- Header -->
-        <header class="glass rounded-2xl px-4 sm:px-6 py-4 shadow-sm border border-gray-100 mb-4 sm:mb-6 flex items-center justify-between gap-3">
+        <!-- ============ HEADER ============ -->
+        <header class="app-header glass rounded-2xl px-4 sm:px-6 py-4 shadow-sm mb-4 sm:mb-5 flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0">
                 <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-indigo-600 to-purple-600 rounded-xl flex items-center justify-center shadow-lg flex-shrink-0">
-                    <i data-lucide="badge-dollar-sign" class="w-5 h-5 sm:w-7 sm:h-7 text-white"></i>
+                    <i data-lucide="badge-dollar-sign" class="w-5 h-5 sm:w-6 sm:h-6 text-white"></i>
                 </div>
                 <div class="min-w-0">
-                    <h1 class="text-base sm:text-2xl font-bold text-gray-800 truncate">Sales Manager</h1>
-                    <p class="text-xs sm:text-sm text-gray-500 truncate">Sell phones from inventory</p>
+                    <h1 class="text-base sm:text-xl font-bold text-gray-800 truncate">Sales Manager</h1>
+                    <p class="text-xs sm:text-sm text-gray-500 truncate">Sell phones from Flipkart &amp; Cashify inventory</p>
                 </div>
             </div>
             <div class="flex items-center gap-1.5 sm:gap-2 flex-shrink-0">
                 <span id="connectionStatus" class="hidden sm:flex items-center gap-1.5 px-3 py-1 bg-green-50 rounded-full text-xs font-medium text-green-700">
-                    <div class="w-2 h-2 bg-green-500 rounded-full pulse-ring" id="statusDot"></div>
+                    <span class="w-2 h-2 bg-green-500 rounded-full pulse-ring" id="statusDot"></span>
                     <span id="statusText">Online</span>
                 </span>
-                <button onclick="refreshInventory()" class="btn-action refresh" style="padding: 8px;">
+                <button onclick="refreshInventory()" class="btn-action refresh" style="padding: 8px 12px;" title="Refresh">
                     <i data-lucide="refresh-cw"></i>
                 </button>
             </div>
         </header>
 
-        <!-- ====== STATS ====== -->
-        <div class="grid grid-cols-2 gap-3 mb-4">
-            <div class="stat-card rounded-2xl p-3 sm:p-4 shadow-sm">
-                <div class="flex items-center gap-2 sm:gap-3">
-                    <div class="w-9 h-9 sm:w-10 sm:h-10 bg-blue-100 rounded-xl flex items-center justify-center flex-shrink-0">
-                        <i data-lucide="package-check" class="w-4 h-4 sm:w-5 sm:h-5 text-blue-600"></i>
+        <!-- ============ SOURCE TABS ============ -->
+        <div class="source-tabs mb-4 sm:mb-5" id="sourceTabs">
+            <button class="source-tab active" data-source="flipkart" onclick="switchSource('flipkart')">
+                <span class="brand-dot"></span>
+                <span>Flipkart</span>
+            </button>
+            <button class="source-tab" data-source="cashify" onclick="switchSource('cashify')">
+                <span class="brand-dot"></span>
+                <span>Cashify</span>
+            </button>
+        </div>
+
+        <!-- ============ STATS ============ -->
+        <div class="grid grid-cols-2 gap-3 mb-4" id="statsGrid">
+            <div class="stat-card flipkart-accent rounded-2xl p-4 shadow-sm" id="statCardStock">
+                <div class="flex items-center gap-3 pl-2">
+                    <div class="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center flex-shrink-0">
+                        <i data-lucide="package-check" class="w-5 h-5 text-blue-600"></i>
                     </div>
                     <div class="min-w-0">
                         <p class="text-xl sm:text-2xl font-bold text-gray-800" id="statInventory">0</p>
@@ -305,10 +467,10 @@
                     </div>
                 </div>
             </div>
-            <div class="stat-card rounded-2xl p-3 sm:p-4 shadow-sm">
-                <div class="flex items-center gap-2 sm:gap-3">
-                    <div class="w-9 h-9 sm:w-10 sm:h-10 bg-purple-100 rounded-xl flex items-center justify-center flex-shrink-0">
-                        <i data-lucide="trending-up" class="w-4 h-4 sm:w-5 sm:h-5 text-purple-600"></i>
+            <div class="stat-card flipkart-accent rounded-2xl p-4 shadow-sm" id="statCardSold">
+                <div class="flex items-center gap-3 pl-2">
+                    <div class="w-10 h-10 bg-purple-100 rounded-xl flex items-center justify-center flex-shrink-0">
+                        <i data-lucide="trending-up" class="w-5 h-5 text-purple-600"></i>
                     </div>
                     <div class="min-w-0">
                         <p class="text-xl sm:text-2xl font-bold text-gray-800" id="statSold">0</p>
@@ -318,15 +480,20 @@
             </div>
         </div>
 
-        <!-- ====== SEARCH BAR ====== -->
+        <!-- ============ SEARCH ============ -->
         <div class="glass rounded-2xl p-3 sm:p-4 shadow-sm border border-gray-100 mb-3 sm:mb-4">
             <div class="flex flex-col sm:flex-row gap-2">
-                <input type="text" id="inventorySearch" placeholder="Search Order ID or Model..." class="input-field" onkeyup="if(event.key==='Enter') applySearch()" />
+                <input type="text"
+                       id="inventorySearch"
+                       placeholder="Search Order ID, Model, IMEI, or Customer..."
+                       class="input-field"
+                       autocomplete="off"
+                       onkeyup="if(event.key==='Enter') applySearch()" />
                 <div class="flex gap-2">
-                    <button onclick="applySearch()" class="btn-action sell flex-1 sm:flex-none">
-                        <i data-lucide="search"></i> <span class="sm:hidden">Search</span>
+                    <button onclick="applySearch()" class="btn-action primary flex-1 sm:flex-none">
+                        <i data-lucide="search"></i> <span class="sm:inline">Search</span>
                     </button>
-                    <button onclick="clearSearch()" class="btn-action refresh flex-1 sm:flex-none">
+                    <button onclick="clearSearch()" class="btn-action view flex-1 sm:flex-none" title="Clear">
                         <i data-lucide="x"></i>
                     </button>
                 </div>
@@ -337,9 +504,7 @@
             </div>
         </div>
 
-        <!-- ====== INVENTORY LIST (Cards on mobile, Table on desktop) ====== -->
-        
-        <!-- Mobile: Card view -->
+        <!-- ============ INVENTORY: Mobile Cards ============ -->
         <div id="inventoryCards" class="space-y-3 sm:hidden">
             <div class="empty-state">
                 <i data-lucide="inbox"></i>
@@ -348,21 +513,30 @@
             </div>
         </div>
 
-        <!-- Desktop: Table view -->
+        <!-- ============ INVENTORY: Desktop Table ============ -->
         <div class="hidden sm:block glass rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
             <div class="overflow-x-auto">
                 <table class="w-full text-sm">
                     <thead>
                         <tr class="bg-gray-50 border-b border-gray-100">
                             <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">#</th>
+                            <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Source</th>
                             <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Order ID</th>
                             <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Model</th>
+                            <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">IMEI</th>
                             <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Customer</th>
-                            <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Action</th>
+                            <th class="text-left py-3 px-4 text-xs font-bold text-gray-500 uppercase">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="inventoryTableBody">
-                        <tr><td colspan="5"><div class="empty-state"><i data-lucide="inbox"></i><p class="text-sm font-medium">No inventory</p></div></td></tr>
+                        <tr>
+                            <td colspan="7">
+                                <div class="empty-state">
+                                    <i data-lucide="inbox"></i>
+                                    <p class="text-sm font-medium">No inventory</p>
+                                </div>
+                            </td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
@@ -370,13 +544,13 @@
 
     </div>
 
-    <!-- ====== SELL MODAL (Bottom sheet on mobile) ====== -->
+    <!-- ============ SELL MODAL ============ -->
     <div id="sellModal" class="fixed inset-0 z-50 modal-overlay flex items-end sm:items-center justify-center" style="display:none;">
         <div class="mobile-modal slide-up sell-modal">
-            <!-- Drag handle (mobile) -->
             <div class="sm:hidden flex justify-center pt-2 pb-1">
                 <div class="w-10 h-1 bg-gray-300 rounded-full"></div>
             </div>
+
             <div class="sticky top-0 bg-white z-10 px-5 pt-2 sm:pt-5 pb-3 border-b border-gray-100 flex items-center justify-between">
                 <h3 class="font-bold text-lg flex items-center gap-2">
                     <i data-lucide="badge-dollar-sign" class="w-5 h-5 text-green-600"></i>
@@ -386,6 +560,17 @@
                     <i data-lucide="x" class="w-5 h-5 text-gray-500"></i>
                 </button>
             </div>
+
+            <div class="px-5 pt-3">
+                <div id="sellSourceBanner" class="rounded-xl px-3 py-2 text-xs font-bold flex items-center justify-between" style="background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;">
+                    <span class="flex items-center gap-2">
+                        <span style="width:8px;height:8px;border-radius:50%;background:#6366f1;display:inline-block;"></span>
+                        Selling from Flipkart
+                    </span>
+                    <span id="sellSourceTag">FLIPKART</span>
+                </div>
+            </div>
+
             <div class="p-5 space-y-3">
                 <div class="field-group">
                     <label>Order ID</label>
@@ -394,6 +579,10 @@
                 <div class="field-group">
                     <label>Phone Model</label>
                     <input type="text" id="sellModel" readonly />
+                </div>
+                <div class="field-group">
+                    <label>IMEI</label>
+                    <input type="text" id="sellImei" readonly class="font-mono text-xs" />
                 </div>
                 <div class="field-group">
                     <label>Customer Name</label>
@@ -416,21 +605,25 @@
                     <input type="date" id="sellSaleDate" />
                 </div>
             </div>
+
             <div class="sticky bottom-0 bg-white px-5 py-4 border-t border-gray-100 flex gap-2">
-                <button onclick="closeSellModal()" class="flex-1 py-3 rounded-xl bg-gray-100 text-gray-700 font-semibold hover:bg-gray-200 transition">Cancel</button>
-                <button onclick="confirmSell()" class="flex-1 py-3 rounded-xl bg-green-600 text-white font-semibold hover:bg-green-700 transition flex items-center justify-center gap-2">
-                    <i data-lucide="check-circle" class="w-4 h-4"></i> Confirm
+                <button onclick="closeSellModal()" class="flex-1 py-3 rounded-xl bg-gray-100 text-gray-700 font-semibold hover:bg-gray-200 transition">
+                    Cancel
+                </button>
+                <button onclick="confirmSell()" id="confirmSellBtn" class="flex-1 py-3 rounded-xl bg-green-600 text-white font-semibold hover:bg-green-700 transition flex items-center justify-center gap-2">
+                    <i data-lucide="check-circle" class="w-4 h-4"></i> Confirm Sale
                 </button>
             </div>
         </div>
     </div>
 
-    <!-- ====== DETAIL MODAL ====== -->
+    <!-- ============ DETAIL MODAL ============ -->
     <div id="detailModal" class="fixed inset-0 z-50 modal-overlay flex items-end sm:items-center justify-center" style="display:none;">
         <div class="mobile-modal slide-up">
             <div class="sm:hidden flex justify-center pt-2 pb-1">
                 <div class="w-10 h-1 bg-gray-300 rounded-full"></div>
             </div>
+
             <div class="sticky top-0 bg-white z-10 px-5 pt-2 sm:pt-5 pb-3 border-b border-gray-100 flex items-center justify-between">
                 <h3 class="font-bold text-lg flex items-center gap-2">
                     <i data-lucide="file-text" class="w-5 h-5 text-indigo-600"></i>
@@ -440,19 +633,23 @@
                     <i data-lucide="x" class="w-5 h-5 text-gray-500"></i>
                 </button>
             </div>
+
             <div class="p-5" id="detailContent">
                 <div class="text-center py-8 text-gray-400">
                     <span class="spinner-sm"></span>
                     <p class="text-sm mt-2">Loading...</p>
                 </div>
             </div>
+
             <div class="sticky bottom-0 bg-white px-5 py-4 border-t border-gray-100">
-                <button onclick="closeDetailModal()" class="w-full py-3 rounded-xl bg-gray-100 text-gray-700 font-semibold hover:bg-gray-200 transition">Close</button>
+                <button onclick="closeDetailModal()" class="w-full py-3 rounded-xl bg-gray-100 text-gray-700 font-semibold hover:bg-gray-200 transition">
+                    Close
+                </button>
             </div>
         </div>
     </div>
 
-    <!-- External JS -->
+    <!-- ============ SCRIPT ============ -->
     <script src="script.js"></script>
 
 </body>
