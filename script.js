@@ -1,13 +1,5 @@
-// ================================================================
-// Sales Manager · Flipkart + Cashify
-// Dual Firebase integration — Flipkart (default) + Cashify (secondary)
-// + Smart Return Management System (new)
-// ================================================================
-
-// ==========================================
-// FIREBASE CONFIG — FLIPKART (default app)
-// ==========================================
-const flipkartConfig = {
+// === SECTION 1: FIREBASE CONFIG ===
+const firebaseConfig = {
     apiKey: "AIzaSyDGJWdgj2GBL-44gXZ9W0mWnOfsczwPXdw",
     authDomain: "mobile-shop-9ea44.firebaseapp.com",
     databaseURL: "https://mobile-shop-9ea44-default-rtdb.firebaseio.com",
@@ -17,144 +9,646 @@ const flipkartConfig = {
     appId: "1:902893829958:web:f2f429ad9290c56f4d6f47",
     measurementId: "G-V4JQT7Z8T9"
 };
-firebase.initializeApp(flipkartConfig);
-const flipkartDb = firebase.database();
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+const storage = firebase.storage();
 
-// ==========================================
-// FIREBASE CONFIG — CASHIFY (secondary app)
-// ==========================================
-const cashifyConfig = {
-    apiKey: "AIzaSyD1XNPVJfKzPoNgxo5R33zxOCebH2H613w",
-    authDomain: "cashify-1cea1.firebaseapp.com",
-    databaseURL: "https://cashify-1cea1-default-rtdb.firebaseio.com",
-    projectId: "cashify-1cea1",
-    storageBucket: "cashify-1cea1.firebasestorage.app",
-    messagingSenderId: "141846449557",
-    appId: "1:141846449557:web:8afe3b2c843b1297a3fa9c",
-    measurementId: "G-SNC5ELYPL6"
-};
-const cashifyApp = firebase.initializeApp(cashifyConfig, "cashifyApp");
-const cashifyDb = cashifyApp.database();
-
-// ==========================================
-// SOURCE HELPERS
-// ==========================================
-function getDb(source) {
-    return source === 'cashify' ? cashifyDb : flipkartDb;
-}
-function getSourceLabel(source) {
-    return source === 'cashify' ? 'Cashify' : 'Flipkart';
-}
-function getSourceTheme(source) {
-    return source === 'cashify'
-        ? { primary: '#12CAA7', dark: '#0FA88B', light: '#E6FAF6', soft: '#d1fae5', border: '#a7f3d0', text: '#0FA88B', pill: 'cashify', accent: 'cashify-accent', src: 'cashify-src' }
-        : { primary: '#6366f1', dark: '#4f46e5', light: '#eef2ff', soft: '#e0e7ff', border: '#c7d2fe', text: '#4338ca', pill: 'flipkart', accent: 'flipkart-accent', src: 'flipkart-src' };
+// === SECTION 2: HELPER FUNCTIONS (getLocalDate) ===
+function getLocalDate() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
 }
 
-// ==========================================
-// COMMISSION BRACKETS (Flipkart only)
-// ==========================================
-const COMMISSION_BRACKETS = [
-    { min: 0, max: 10000, type: 'percentage', value: 10 },
-    { min: 10001, max: 31000, type: 'percentage', value: 8 },
-    { min: 31001, max: Infinity, type: 'fixed', value: 2500 }
-];
-function calculateCommission(purchasePrice) {
-    if (!purchasePrice || purchasePrice <= 0) return 0;
-    for (const b of COMMISSION_BRACKETS) {
-        if (purchasePrice >= b.min && purchasePrice <= b.max) {
-            if (b.type === 'percentage') return Math.round((purchasePrice * b.value) / 100);
-            return b.value;
+// === SECTION 3: GLOBAL STATE ===
+let currentUser = null;
+let currentStatus = '';
+let selectedReason = '';
+let zxingCodeReader = null;
+let isScanning = false;
+let hiddenImei2 = '';
+let scanMode = 'barcode';
+let pendingFilter = 'all';
+let allPendingOrders = [];
+let pendingDoneOrderId = null;
+let tesseractWorker = null;
+let ocrInterval = null;
+let isOcrScanning = false;
+let ocrAttemptCount = 0;
+let lastDetectedImei = '';
+
+// ========== SPEC (RAM / STORAGE / NETWORK) STATE ==========
+let selectedRam = '';
+let selectedStorage = '';
+let selectedNetwork = '';
+const RAM_OPTIONS = ['1GB','2GB','3GB','4GB','6GB','8GB','12GB','16GB','18GB','24GB'];
+const STORAGE_OPTIONS = ['8GB','16GB','32GB','64GB','128GB','256GB','512GB','1TB','2TB'];
+// 🔥 Updated per spec: include 1G
+const NETWORK_OPTIONS = ['1G','2G','3G','4G','5G'];
+
+function resetSpecSelection() {
+    selectedRam = '';
+    selectedStorage = '';
+    selectedNetwork = '';
+}
+
+function buildSpecChips(kind, options, extraClass) {
+    return options.map(o =>
+        `<button type="button" class="spec-chip ${extraClass || ''}" data-kind="${kind}" data-val="${o}" onclick="selectSpec('${kind}','${o}',this)">${o}</button>`
+    ).join('');
+}
+
+function selectSpec(kind, val, el) {
+    const group = el.parentElement;
+    const already = el.classList.contains('active');
+    group.querySelectorAll('.spec-chip').forEach(b => b.classList.remove('active'));
+    const finalVal = already ? '' : val;
+    if (!already) el.classList.add('active');
+    if (kind === 'ram') selectedRam = finalVal;
+    if (kind === 'storage') selectedStorage = finalVal;
+    if (kind === 'network') selectedNetwork = finalVal;
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch(_){} }
+    updateSpecUI();
+}
+
+function updateSpecUI() {
+    const ramPick = document.getElementById('ramPick');
+    const stoPick = document.getElementById('storagePick');
+    const netPick = document.getElementById('networkPick');
+    if (ramPick) { ramPick.textContent = selectedRam || 'Not selected'; ramPick.className = 'picked' + (selectedRam ? '' : ' empty'); }
+    if (stoPick) { stoPick.textContent = selectedStorage || 'Not selected'; stoPick.className = 'picked' + (selectedStorage ? '' : ' empty'); }
+    if (netPick) { netPick.textContent = selectedNetwork || 'Not selected'; netPick.className = 'picked' + (selectedNetwork ? '' : ' empty'); }
+    const ramStorageInput = document.getElementById('ramStorage');
+    const networkInput = document.getElementById('networkType');
+    const combo = (selectedRam && selectedStorage) ? (selectedRam + '/' + selectedStorage) : '';
+    if (ramStorageInput) ramStorageInput.value = combo;
+    if (networkInput) networkInput.value = selectedNetwork;
+    const box = document.getElementById('specSummary');
+    if (!box) return;
+    const done = selectedRam && selectedStorage && selectedNetwork;
+    box.className = 'spec-summary' + (done ? ' ok' : '');
+    const missing = [];
+    if (!selectedRam) missing.push('RAM');
+    if (!selectedStorage) missing.push('Storage');
+    if (!selectedNetwork) missing.push('Network');
+    box.innerHTML = `
+        <div class="head">SELECTED DEVICE SPECS</div>
+        <div class="body">${selectedRam || '—'} RAM &nbsp;·&nbsp; ${selectedStorage || '—'} Storage &nbsp;·&nbsp; ${selectedNetwork || '—'}</div>
+        ${done ? '' : `<div class="spec-missing">⚠️ Please select: ${missing.join(', ')}</div>`}
+    `;
+}
+
+// ========== BILL / AADHAAR IMAGE STATE (Pickup) ==========
+const PICKUP_MAX_IMAGES = 3;
+let pickupBillImages = [];
+let pickupAadhaarImages = [];
+
+// === SECTION 4: IMAGE HANDLING ===
+function compressImageFile(file, maxDim = 800, quality = 0.55) {
+    return new Promise((resolve, reject) => {
+        if (!file) return reject('No file');
+        if (!file.type.startsWith('image/')) return reject('Not an image');
+        const reader = new FileReader();
+        reader.onerror = () => reject('Read error');
+        reader.onload = () => {
+            const img = new Image();
+            img.onerror = () => reject('Image decode error');
+            img.onload = () => {
+                let { width, height } = img;
+                if (width > height) {
+                    if (width > maxDim) { height = Math.round(height * maxDim / width); width = maxDim; }
+                } else {
+                    if (height > maxDim) { width = Math.round(width * maxDim / height); height = maxDim; }
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = width; canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, width, height);
+                ctx.drawImage(img, 0, 0, width, height);
+                try { resolve(canvas.toDataURL('image/jpeg', quality)); } catch (e) { reject(e); }
+            };
+            img.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+function renderPickupImgList(which) {
+    const arr = which === 'bill' ? pickupBillImages : pickupAadhaarImages;
+    const previewEl = document.getElementById(which === 'bill' ? 'billImgPreview' : 'aadhaarImgPreview');
+    const infoEl = document.getElementById(which === 'bill' ? 'billImgInfo' : 'aadhaarImgInfo');
+    if (!previewEl) return;
+    if (!arr.length) {
+        previewEl.innerHTML = '';
+        if (infoEl) infoEl.textContent = `${PICKUP_MAX_IMAGES} images max · ${PICKUP_MAX_IMAGES} slots free`;
+        return;
+    }
+    let totalKB = 0;
+    previewEl.innerHTML = `<div class="grid grid-cols-3 gap-2">` + arr.map((d, i) => {
+        const kb = Math.round((d.length * 3 / 4) / 1024); totalKB += kb;
+        return `<div class="relative group">
+            <img src="${d}" class="w-full h-20 object-cover rounded-lg border border-gray-200" alt="p${i}">
+            <button type="button" onclick="removePickupImage('${which}',${i})" class="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-red-600 text-white text-xs font-bold shadow-md">✕</button>
+            <div class="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-[9px] text-center rounded-b-lg">${kb}KB</div>
+        </div>`;
+    }).join('') + `</div>`;
+    if (infoEl) infoEl.textContent = `✅ ${arr.length}/${PICKUP_MAX_IMAGES} · total ~${totalKB} KB`;
+}
+
+async function handlePickupImagePick(inputEl, which) {
+    const files = inputEl.files ? Array.from(inputEl.files) : [];
+    if (!files.length) return;
+    const arr = which === 'bill' ? pickupBillImages : pickupAadhaarImages;
+    const infoEl = document.getElementById(which === 'bill' ? 'billImgInfo' : 'aadhaarImgInfo');
+    if (arr.length >= PICKUP_MAX_IMAGES) {
+        showToast(`Max ${PICKUP_MAX_IMAGES} images allowed`, 'error');
+        inputEl.value = ''; return;
+    }
+    const room = PICKUP_MAX_IMAGES - arr.length;
+    const toProcess = files.slice(0, room);
+    if (infoEl) infoEl.textContent = '⏳ Compressing…';
+    for (const f of toProcess) {
+        try { arr.push(await compressImageFile(f)); }
+        catch (e) { console.error(e); showToast('Image process failed', 'error'); }
+    }
+    inputEl.value = '';
+    renderPickupImgList(which);
+}
+
+function removePickupImage(which, idx) {
+    const arr = which === 'bill' ? pickupBillImages : pickupAadhaarImages;
+    arr.splice(idx, 1);
+    renderPickupImgList(which);
+}
+
+function clearPickupImageState() {
+    pickupBillImages = [];
+    pickupAadhaarImages = [];
+}
+
+// === SECTION 5: REASONS ===
+function selectReason(el, text) {
+    selectedReason = text || '';
+    document.querySelectorAll('.reason-btn').forEach(btn => btn.classList.remove('active'));
+    if (el) el.classList.add('active');
+    const otherInput = document.getElementById('otherReason');
+    if (otherInput) {
+        if (selectedReason && selectedReason.toLowerCase().includes('other')) {
+            otherInput.classList.remove('hidden');
+            otherInput.focus();
+        } else {
+            otherInput.classList.add('hidden');
+            otherInput.value = '';
         }
     }
-    return 0;
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch (_) {} }
 }
 
-// ==========================================
-// HELPERS
-// ==========================================
-function getLocalYMD(d = new Date()) {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-}
-function escapeHtml(s) {
-    return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-function formatTimeShort(d = new Date()) {
-    return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
-}
-function refreshIcons() {
-    if (window.lucide) { try { lucide.createIcons(); } catch (e) {} }
-}
-function formatINR(num) {
-    if (num === undefined || num === null || isNaN(num)) return '₹0';
-    return '₹' + new Intl.NumberFormat('en-IN').format(Math.round(num));
-}
+const rejectReasons = [
+    { text: 'Customer wanted price only', icon: 'indian-rupee' },
+    { text: 'Customer denied price drop', icon: 'trending-down' },
+    { text: 'Device details mismatch', icon: 'alert-triangle' },
+    { text: 'Fake device detected', icon: 'shield-alert' },
+    { text: 'Phone has loan / finance lock', icon: 'landmark' },
+    { text: 'Phone is dead / not working', icon: 'battery-warning' },
+    { text: 'Other reason', icon: 'more-horizontal' }
+];
+const rescheduleReasons = [
+    { text: 'On the way', icon: 'map-pin' },
+    { text: 'Customer not picking call', icon: 'phone-missed' },
+    { text: 'Wrong address / pin code', icon: 'map-pin-off' },
+    { text: 'Customer asked for tomorrow', icon: 'calendar' },
+    { text: 'Customer not at home', icon: 'home' },
+    { text: 'Other reason', icon: 'more-horizontal' }
+];
 
-// ==========================================
-// STATE
-// ==========================================
-let currentView = 'inventory';        // 'inventory' | 'returns'
-let currentSource = 'flipkart';
-let inventoryList = [];
-let filteredInventory = [];
-let sellOrderData = null;
-let isRefreshing = false;
+// === SECTION 6: USER LISTENER ===
+let userListenerRef = null;
 
-// Returns state
-let returnSearchResults = [];
-let selectedReturnPhone = null;
-let exchangeSource = 'flipkart';
-let exchangeInventoryList = [];
-let isProcessingReturn = false;
-let lastReturnMessage = '';
-
-// Cache: overhead per phone for each source
-const overheadCache = {
-    flipkart: { ts: 0, value: 0 },
-    cashify:  { ts: 0, value: 0 }
-};
-const OVERHEAD_TTL = 10 * 60 * 1000;
-const lastUpdatedBySource = { flipkart: null, cashify: null };
-
-// ==========================================
-// DOM REFS
-// ==========================================
-const toastEl = document.getElementById('toast');
-
-// ==========================================
-// TOAST
-// ==========================================
-function showToast(msg, type = 'info', duration = 3000) {
-    if (!toastEl) return;
-    toastEl.textContent = msg;
-    toastEl.className = 'toast-fixed ' + type;
-    void toastEl.offsetWidth;
-    toastEl.classList.add('show');
-    clearTimeout(toastEl._timer);
-    toastEl._timer = setTimeout(() => toastEl.classList.remove('show'), duration);
+function startUserExistenceCheck() {
+    if (!currentUser) return;
+    stopUserExistenceCheck();
+    const userRef = db.ref('users/' + currentUser.username);
+    userRef.on('value', (snapshot) => {
+        if (!snapshot.exists()) {
+            logoutUser();
+            showToast('❌ Your account has been deleted. Logged out.', 'error');
+            return;
+        }
+        const data = snapshot.val();
+        if (data.is_active === false) {
+            logoutUser();
+            showToast('🔒 Your account has been deactivated (employee left).', 'error');
+            return;
+        }
+        if (data.forceLogout === true) {
+            userRef.update({ forceLogout: null }).catch(() => {});
+            logoutUser();
+            showToast('🔒 You have been logged out by admin.', 'info');
+            return;
+        }
+        if (data.is_blocked === true && data.role !== 'admin') {
+            const today = getLocalDate();
+            const blockedDate = data.blocked_date || '';
+            if (blockedDate !== today) {
+                userRef.update({ is_blocked: false, blocked_date: null }).catch(() => {});
+                document.getElementById('blockedOverlay').style.display = 'none';
+                showToast('🔓 Auto-unblocked (new day)', 'info');
+            } else {
+                document.getElementById('blockedOverlay').style.display = 'flex';
+            }
+        } else {
+            document.getElementById('blockedOverlay').style.display = 'none';
+        }
+    });
+    userListenerRef = userRef;
 }
 
-// ==========================================
-// CONNECTION STATUS
-// ==========================================
+function stopUserExistenceCheck() {
+    if (userListenerRef) { userListenerRef.off(); userListenerRef = null; }
+}
+
+// === SECTION 7: AUTHENTICATION ===
+async function loginUser() {
+    const username = document.getElementById('loginUsername').value.trim().toLowerCase();
+    const password = document.getElementById('loginPassword').value.trim();
+    const errorEl = document.getElementById('loginError');
+    if (!username || !password) {
+        errorEl.textContent = 'Please enter both username and password.';
+        errorEl.style.display = 'block'; return;
+    }
+    errorEl.style.display = 'none';
+    try {
+        const snap = await db.ref('users/' + username).once('value');
+        if (!snap.exists()) {
+            errorEl.textContent = 'User not found. Check username.';
+            errorEl.style.display = 'block'; return;
+        }
+        const userData = snap.val();
+        if (userData.password !== password) {
+            errorEl.textContent = 'Incorrect password.';
+            errorEl.style.display = 'block'; return;
+        }
+        if (userData.is_active === false) {
+            errorEl.textContent = '❌ Account disabled (employee left). Contact admin.';
+            errorEl.style.display = 'block'; return;
+        }
+        currentUser = { username, name: userData.name, ...userData };
+        localStorage.setItem('flipkart_agent_user', JSON.stringify(currentUser));
+        showMainApp();
+        showToast('✅ Welcome, ' + currentUser.name + '!', 'success');
+        if (currentUser.role !== 'admin') {
+            await checkAttendanceAndBlock();
+            loadAttendanceHistory();
+        } else {
+            document.getElementById('attendanceTabBtn').style.display = 'none';
+            document.getElementById('blockedOverlay').style.display = 'none';
+        }
+        loadTodayStats();
+        loadPendingOrders();
+        startUserExistenceCheck();
+    } catch (e) {
+        console.error(e);
+        errorEl.textContent = 'Something went wrong. Try again.';
+        errorEl.style.display = 'block';
+    }
+}
+
+function logoutUser() {
+    stopUserExistenceCheck();
+    localStorage.removeItem('flipkart_agent_user');
+    currentUser = null;
+    document.getElementById('mainApp').style.display = 'none';
+    document.getElementById('authOverlay').style.display = 'flex';
+    document.getElementById('blockedOverlay').style.display = 'none';
+    showToast('Logged out', 'info');
+}
+
+function checkAuth() {
+    const stored = localStorage.getItem('flipkart_agent_user');
+    if (stored) {
+        try {
+            currentUser = JSON.parse(stored);
+            verifyUserExists(currentUser.username).then(async exists => {
+                if (exists) {
+                    const userSnap = await db.ref('users/' + currentUser.username).once('value');
+                    const userData = userSnap.val();
+                    if (userData && userData.is_active === false) {
+                        logoutUser();
+                        showToast('🔒 Your account has been deactivated (left).', 'error');
+                        return;
+                    }
+                    showMainApp();
+                    if (currentUser.role !== 'admin') {
+                        await checkAttendanceAndBlock();
+                        loadAttendanceHistory();
+                    } else {
+                        document.getElementById('attendanceTabBtn').style.display = 'none';
+                        document.getElementById('blockedOverlay').style.display = 'none';
+                    }
+                    loadTodayStats();
+                    loadPendingOrders();
+                    startUserExistenceCheck();
+                } else {
+                    logoutUser();
+                    showToast('❌ Account deleted. Please contact admin.', 'error');
+                }
+            });
+            return true;
+        } catch (e) {
+            localStorage.removeItem('flipkart_agent_user');
+        }
+    }
+    return false;
+}
+
+function verifyUserExists(username) {
+    return db.ref('users/' + username).once('value').then(snap => snap.exists());
+}
+
+function showMainApp() {
+    document.getElementById('authOverlay').style.display = 'none';
+    document.getElementById('mainApp').style.display = 'block';
+    document.getElementById('userNameDisplay').textContent = currentUser.name || currentUser.username;
+    setupOfflineDetection();
+    lucide.createIcons();
+    startUserExistenceCheck();
+}
+
+// === SECTION 8: CHANGE PASSWORD ===
+function showChangePassword() {
+    if (!currentUser) return;
+    Swal.fire({
+        title: 'Change Password',
+        html: `
+            <p class="text-sm text-gray-600 mb-2">Change your login password</p>
+            <input type="password" id="newPw" class="swal2-input" placeholder="New password" minlength="4">
+            <input type="password" id="confirmPw" class="swal2-input" placeholder="Confirm" minlength="4">
+        `,
+        showCancelButton: true,
+        confirmButtonText: 'Update Password',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#4f46e5',
+        cancelButtonColor: '#64748b',
+        preConfirm: () => {
+            const n = document.getElementById('newPw').value;
+            const c = document.getElementById('confirmPw').value;
+            if (!n || n.length < 4) { Swal.showValidationMessage('Min 4 chars'); return false; }
+            if (n !== c) { Swal.showValidationMessage('No match'); return false; }
+            return n;
+        }
+    }).then(async (r) => {
+        if (r.isConfirmed) {
+            try {
+                await db.ref('users/' + currentUser.username + '/password').set(r.value);
+                currentUser.password = r.value;
+                localStorage.setItem('flipkart_agent_user', JSON.stringify(currentUser));
+                showToast('✅ Password updated', 'success');
+            } catch (e) { showToast('Error', 'error'); }
+        }
+    });
+}
+
+// === SECTION 9: ATTENDANCE & SALARY SYSTEM ===
+async function checkAttendanceAndBlock() {
+    if (!currentUser) return;
+    if (currentUser.role === 'admin') return;
+    const today = getLocalDate();
+    const dateEl = document.getElementById('attendanceDateDisplay');
+    if (dateEl) dateEl.textContent = today;
+    try {
+        const userSnap = await db.ref('users/' + currentUser.username).once('value');
+        const userData = userSnap.val() || {};
+        if (userData.is_blocked === true && userData.blocked_date !== today) {
+            await db.ref('users/' + currentUser.username).update({ is_blocked: false, blocked_date: null });
+            const overlay = document.getElementById('blockedOverlay');
+            if (overlay) overlay.style.display = 'none';
+        }
+        const freshSnap = await db.ref('users/' + currentUser.username + '/is_blocked').once('value');
+        if (freshSnap.val() === true) {
+            const overlay = document.getElementById('blockedOverlay');
+            if (overlay) overlay.style.display = 'flex';
+            updateAttendanceUI('blocked');
+            return;
+        }
+        const attSnap = await db.ref('attendance/' + currentUser.username + '/' + today).once('value');
+        const att = attSnap.val();
+        if (att && att.status === 'present') {
+            updateAttendanceUI('present');
+            loadAttendanceHistory();
+            loadAgentSalarySummary();
+            return;
+        }
+        if (att && att.status === 'absent' && att.blocked) {
+            const overlay = document.getElementById('blockedOverlay');
+            if (overlay) overlay.style.display = 'flex';
+            updateAttendanceUI('blocked');
+            loadAttendanceHistory();
+            return;
+        }
+        updateAttendanceUI('unmarked');
+        loadAttendanceHistory();
+        loadAgentSalarySummary();
+    } catch (e) { console.error('Error checking attendance:', e); }
+}
+
+function updateAttendanceUI(status) {
+    const badge = document.getElementById('currentStatusBadge');
+    const actionGrid = document.getElementById('attendanceActionGrid');
+    const lockNotice = document.getElementById('attendanceLockNotice');
+    const overlay = document.getElementById('blockedOverlay');
+    if (!badge) return;
+    if (status === 'present') {
+        badge.className = 'px-3 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800';
+        badge.textContent = '✅ Present';
+        if (actionGrid) actionGrid.style.display = 'none';
+        if (lockNotice) { lockNotice.classList.remove('hidden'); lockNotice.textContent = '✅ Attendance recorded as Present for today.'; }
+        if (overlay) overlay.style.display = 'none';
+    } else if (status === 'blocked' || status === 'absent') {
+        badge.className = 'px-3 py-1 text-xs font-semibold rounded-full bg-rose-100 text-rose-800';
+        badge.textContent = '❌ Blocked / Absent';
+        if (actionGrid) actionGrid.style.display = 'none';
+        if (lockNotice) { lockNotice.classList.remove('hidden'); lockNotice.textContent = '🔒 You are marked Absent/Blocked for today. Contact admin to unblock.'; }
+    } else {
+        badge.className = 'px-3 py-1 text-xs font-semibold rounded-full bg-amber-100 text-amber-800';
+        badge.textContent = '⚠️ Not Marked';
+        if (actionGrid) actionGrid.style.display = 'grid';
+        if (lockNotice) lockNotice.classList.add('hidden');
+        if (overlay) overlay.style.display = 'none';
+    }
+}
+
+async function openAttendanceOtpModal() {
+    const today = getLocalDate();
+    const attSnap = await db.ref('attendance/' + currentUser.username + '/' + today).once('value');
+    if (attSnap.exists() && attSnap.val().status) {
+        Swal.fire({ icon: 'info', title: 'Already Marked', text: 'Attendance is already recorded for today.' });
+        return;
+    }
+    const { value: otp, isConfirmed } = await Swal.fire({
+        title: '🔐 Verify OTP',
+        text: 'Enter the 6-digit OTP shared by Admin for today:',
+        input: 'text', inputPlaceholder: '6-digit OTP',
+        inputAttributes: { maxlength: 6, inputmode: 'numeric' },
+        showCancelButton: true, confirmButtonText: 'Verify & Mark Present',
+        cancelButtonText: 'Cancel', confirmButtonColor: '#059669', cancelButtonColor: '#64748b'
+    });
+    if (!isConfirmed || !otp) return;
+    const trimmedOtp = otp.trim();
+    if (trimmedOtp.length !== 6) {
+        Swal.fire({ icon: 'error', title: 'Invalid OTP', text: 'Please enter a valid 6-digit OTP.' });
+        return;
+    }
+    try {
+        let otpData = null;
+        const dailySnap = await db.ref('daily_otp/' + today + '/' + currentUser.username).once('value');
+        if (dailySnap.exists()) otpData = dailySnap.val();
+        else {
+            const agentOtpSnap = await db.ref('otp/' + currentUser.username).once('value');
+            if (agentOtpSnap.exists()) otpData = agentOtpSnap.val();
+        }
+        if (!otpData || String(otpData.otp).trim() !== trimmedOtp) {
+            Swal.fire({ icon: 'error', title: 'Incorrect OTP', text: "The OTP entered is incorrect. Ask Admin for today's OTP." });
+            return;
+        }
+        if (otpData.used === true) {
+            Swal.fire({ icon: 'error', title: 'OTP Already Used', text: 'This OTP has already been used.' });
+            return;
+        }
+        await db.ref('attendance/' + currentUser.username + '/' + today).set({
+            status: 'present', timestamp: Date.now(), otp_used: trimmedOtp,
+            blocked: false, salary_counted: true, marked_by: 'agent_otp'
+        });
+        if (dailySnap.exists()) await db.ref('daily_otp/' + today + '/' + currentUser.username + '/used').set(true);
+        else await db.ref('otp/' + currentUser.username + '/used').set(true);
+        showToast('✅ Attendance marked Present!', 'success');
+        updateAttendanceUI('present');
+        loadAttendanceHistory();
+        loadAgentSalarySummary();
+    } catch (e) {
+        console.error('Error verifying attendance OTP:', e);
+        showToast('Verification failed. Check network.', 'error');
+    }
+}
+
+async function handleMarkAbsent() {
+    const { value: reason, isConfirmed } = await Swal.fire({
+        title: 'Mark as Absent?',
+        text: 'You will be locked for the day. Salary for today will not be counted unless admin unblocks.',
+        input: 'text', inputPlaceholder: 'Reason for absence...',
+        showCancelButton: true, confirmButtonText: 'Yes, Mark Absent',
+        cancelButtonText: 'Cancel', confirmButtonColor: '#dc2626', cancelButtonColor: '#64748b'
+    });
+    if (!isConfirmed) return;
+    const today = getLocalDate();
+    try {
+        await db.ref('attendance/' + currentUser.username + '/' + today).set({
+            status: 'absent', reason: reason || 'Not specified', timestamp: Date.now(),
+            blocked: true, salary_counted: false, marked_by: 'agent_self'
+        });
+        await db.ref('users/' + currentUser.username).update({ is_blocked: true, blocked_date: today });
+        showToast('🔒 Marked as Absent. Account locked for today.', 'info');
+        updateAttendanceUI('blocked');
+        const overlay = document.getElementById('blockedOverlay');
+        if (overlay) overlay.style.display = 'flex';
+        loadAttendanceHistory();
+    } catch (e) {
+        console.error(e);
+        showToast('Failed to mark absent.', 'error');
+    }
+}
+
+async function loadAttendanceHistory() {
+    const container = document.getElementById('attendanceHistoryList');
+    if (!container || !currentUser) return;
+    try {
+        const snap = await db.ref('attendance/' + currentUser.username).limitToLast(7).once('value');
+        const data = snap.val() || {};
+        const dates = Object.keys(data).sort().reverse();
+        if (dates.length === 0) {
+            container.innerHTML = '<div class="text-gray-400 text-center py-2">No recent records found.</div>';
+            return;
+        }
+        let html = '';
+        dates.forEach(d => {
+            const item = data[d];
+            const isPres = item.status === 'present';
+            const isHalf = item.half_day === true;
+            const badgeClass = isHalf ? 'bg-amber-100 text-amber-800' : (isPres ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800');
+            const label = isHalf ? 'Half Day' : (isPres ? 'Present' : 'Absent');
+            html += `<div class="flex items-center justify-between p-2 rounded-lg bg-gray-50 border border-gray-100">
+                <span class="font-medium text-gray-700">${d}</span>
+                <span class="px-2 py-0.5 rounded text-[11px] font-semibold ${badgeClass}">${label}</span>
+            </div>`;
+        });
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<div class="text-gray-400 text-center py-2">Failed to load history.</div>';
+    }
+}
+
+async function loadAgentSalarySummary() {
+    const approvedContent = document.getElementById('salaryApprovedContent');
+    const pendingNotice = document.getElementById('salaryPendingNotice');
+    const badge = document.getElementById('salaryStatusBadge');
+    if (!currentUser || !approvedContent) return;
+    const today = new Date();
+    const curMonth = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0');
+    try {
+        const snap = await db.ref('salaries/' + curMonth + '/' + currentUser.username).once('value');
+        const sal = snap.val();
+        if (sal && (sal.approved === true || sal.status === 'approved' || sal.visible_to_agent === true)) {
+            if (badge) {
+                badge.className = 'text-[11px] px-2.5 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800';
+                badge.textContent = 'Approved by Admin';
+            }
+            approvedContent.style.display = 'block';
+            if (pendingNotice) pendingNotice.style.display = 'none';
+            const base = sal.base_salary || sal.total_salary || 0;
+            const ded = sal.deductions || sal.cut || 0;
+            const net = sal.net_salary || sal.final_payable || (base - ded);
+            const elTotal = document.getElementById('agentTotalSalary');
+            const elDed = document.getElementById('agentDeductions');
+            const elNet = document.getElementById('agentFinalSalary');
+            if (elTotal) elTotal.textContent = '₹' + Number(base).toLocaleString('en-IN');
+            if (elDed) elDed.textContent = '-₹' + Number(ded).toLocaleString('en-IN');
+            if (elNet) elNet.textContent = '₹' + Number(net).toLocaleString('en-IN');
+        } else {
+            if (badge) {
+                badge.className = 'text-[11px] px-2.5 py-0.5 rounded-full font-semibold bg-gray-100 text-gray-600';
+                badge.textContent = 'Pending Admin Approval';
+            }
+            approvedContent.style.display = 'none';
+            if (pendingNotice) pendingNotice.style.display = 'block';
+        }
+    } catch (e) { console.error('Error fetching agent salary:', e); }
+}
+
+// === SECTION 10: TAB SWITCHING ===
+function switchTab(tab) {
+    document.querySelectorAll('#mainTabBar button').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
+    document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+    document.getElementById('tab-' + tab).style.display = 'block';
+    if (tab === 'pending') loadPendingOrders();
+    if (tab === 'attendance') { loadAttendanceHistory(); updateAttendanceUI(); }
+}
+
+// === SECTION 11: OFFLINE DETECTION ===
 function setupOfflineDetection() {
     const updateStatus = () => {
         const isOnline = navigator.onLine;
-        const dot = document.getElementById('statusDot');
-        const text = document.getElementById('statusText');
-        const container = document.getElementById('connectionStatus');
-        if (!container) return;
+        document.getElementById('offlineBanner').classList.toggle('hidden', isOnline);
+        const statusEl = document.getElementById('connectionStatus');
         if (isOnline) {
-            container.className = 'hidden sm:flex items-center gap-1.5 px-3 py-1 bg-green-50 rounded-full text-xs font-medium text-green-700';
-            if (dot) dot.className = 'w-2 h-2 bg-green-500 rounded-full pulse-ring';
-            if (text) text.textContent = 'Online';
+            statusEl.className = 'flex items-center gap-1 px-2 py-1 bg-green-50 rounded-full';
+            statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-green-500 rounded-full pulse-ring"></div><span class="text-[10px] font-medium text-green-700 hidden sm:inline">Online</span>';
         } else {
-            container.className = 'hidden sm:flex items-center gap-1.5 px-3 py-1 bg-red-50 rounded-full text-xs font-medium text-red-700';
-            if (dot) dot.className = 'w-2 h-2 bg-red-500 rounded-full';
-            if (text) text.textContent = 'Offline';
+            statusEl.className = 'flex items-center gap-1 px-2 py-1 bg-red-50 rounded-full';
+            statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-red-500 rounded-full"></div><span class="text-[10px] font-medium text-red-700 hidden sm:inline">Offline</span>';
         }
     };
     window.addEventListener('online', updateStatus);
@@ -162,1362 +656,1361 @@ function setupOfflineDetection() {
     updateStatus();
 }
 
-// ==========================================
-// VIEW SWITCHING  (Inventory / Returns)
-// ==========================================
-function switchView(view) {
-    if (view !== 'inventory' && view !== 'returns') return;
-    if (currentView === view) return;
-
-    currentView = view;
-
-    const invBtn = document.getElementById('viewBtnInventory');
-    const retBtn = document.getElementById('viewBtnReturns');
-    if (invBtn) invBtn.classList.toggle('active', view === 'inventory');
-    if (retBtn) retBtn.classList.toggle('active', view === 'returns');
-
-    document.getElementById('inventoryView').style.display = view === 'inventory' ? 'block' : 'none';
-    document.getElementById('returnsView').style.display = view === 'returns' ? 'block' : 'none';
-
-    updateSourceTabsForView();
-
-    if (view === 'returns') {
-        loadReturnsView();
-        loadReturnsHistory();
-    } else {
-        loadInventory();
-    }
-
-    refreshIcons();
-}
-
-function updateSourceTabsForView() {
-    const isReturns = currentView === 'returns';
-    document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
-        const label = tab.querySelector('span:last-child');
-        if (!label) return;
-        const isFk = tab.dataset.source === 'flipkart';
-        label.textContent = isFk
-            ? (isReturns ? 'Flipkart Returns' : 'Flipkart')
-            : (isReturns ? 'Cashify Returns' : 'Cashify');
-    });
-}
-
-// ==========================================
-// SOURCE SWITCHING
-// ==========================================
-function switchSource(source) {
-    if (source !== 'flipkart' && source !== 'cashify') return;
-    if (currentSource === source) return;
-
-    currentSource = source;
-
-    document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.source === source);
-    });
-
-    const accentClass = source === 'cashify' ? 'cashify-accent' : 'flipkart-accent';
-    const statStock = document.getElementById('statCardStock');
-    const statSold = document.getElementById('statCardSold');
-    if (statStock) { statStock.classList.remove('flipkart-accent', 'cashify-accent'); statStock.classList.add(accentClass); }
-    if (statSold) { statSold.classList.remove('flipkart-accent', 'cashify-accent'); statSold.classList.add(accentClass); }
-
-    // Clear inventory search
-    const searchInput = document.getElementById('inventorySearch');
-    if (searchInput) searchInput.value = '';
-
-    // Clear returns state
-    returnSearchResults = [];
-    selectedReturnPhone = null;
-    const rSearch = document.getElementById('returnSearch');
-    if (rSearch) rSearch.value = '';
-    const rResults = document.getElementById('returnSearchResults');
-    if (rResults) rResults.innerHTML = '';
-    const rForm = document.getElementById('returnFormSection');
-    if (rForm) { rForm.style.display = 'none'; rForm.innerHTML = ''; }
-
-    if (currentView === 'returns') {
-        loadReturnsView();
-        loadReturnsHistory();
-    } else {
-        inventoryList = [];
-        filteredInventory = [];
-        renderInventory();
-        loadInventory();
-    }
-}
-
-// ==========================================
-// LOAD INVENTORY
-// ==========================================
-async function loadInventory() {
-    const db = getDb(currentSource);
-    showToast('🔄 Loading ' + getSourceLabel(currentSource) + ' inventory…', 'info', 1500);
-
+// === SECTION 12: TODAY'S STATS ===
+async function loadTodayStats() {
+    if (!currentUser) return;
     try {
-        const snap = await db.ref('pickups').once('value');
-        const data = snap.val() || {};
-
-        inventoryList = Object.entries(data)
-            .filter(([_, item]) => item.status === 'pickup' && !item.sold)
-            .map(([id, item]) => ({ id, ...item, _source: currentSource }));
-
-        inventoryList.sort((a, b) => {
-            const ta = new Date(a.timestamp || 0).getTime() || 0;
-            const tb = new Date(b.timestamp || 0).getTime() || 0;
-            return tb - ta;
-        });
-
-        lastUpdatedBySource[currentSource] = Date.now();
-
-        applySearch();
-        updateStats(data);
-        updateLastUpdatedLabel();
-    } catch (e) {
-        console.error('Inventory load error:', e);
-        showToast('Error loading ' + getSourceLabel(currentSource) + ' inventory', 'error');
-        const tbody = document.getElementById('inventoryTableBody');
-        const cards = document.getElementById('inventoryCards');
-        const errHtml = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Failed to load inventory</p></div>`;
-        if (cards) cards.innerHTML = errHtml;
-        if (tbody) tbody.innerHTML = `<tr><td colspan="7">${errHtml}</td></tr>`;
-        refreshIcons();
-    }
-}
-
-function updateStats(pickupsData) {
-    if (!pickupsData) {
-        getDb(currentSource).ref('pickups').once('value').then(snap => updateStats(snap.val() || {})).catch(() => {});
-        return;
-    }
-    let soldCount = 0;
-    Object.values(pickupsData).forEach(item => { if (item.sold === true && item.status === 'pickup') soldCount++; });
-    const elInv = document.getElementById('statInventory');
-    const elSold = document.getElementById('statSold');
-    if (elInv) elInv.textContent = inventoryList.length;
-    if (elSold) elSold.textContent = soldCount;
-}
-
-function updateLastUpdatedLabel() {
-    const el = document.getElementById('lastUpdated');
-    if (!el) return;
-    const ts = lastUpdatedBySource[currentSource];
-    if (!ts) { el.textContent = ''; return; }
-    el.textContent = 'Updated ' + formatTimeShort(new Date(ts));
-}
-
-// ==========================================
-// SEARCH (inventory)
-// ==========================================
-function applySearch() {
-    const searchInput = document.getElementById('inventorySearch');
-    const raw = (searchInput ? searchInput.value : '').trim().toLowerCase();
-
-    if (!raw) {
-        filteredInventory = [...inventoryList];
-    } else {
-        filteredInventory = inventoryList.filter(item => {
-            const orderId = String(item.orderId || item.id || '').toLowerCase();
-            const model = String(item.phoneModel || '').toLowerCase();
-            const imei = String(item.imei || '').toLowerCase();
-            const imei2 = String(item.imei2 || '').toLowerCase();
-            const cust = String(item.customerName || '').toLowerCase();
-            return orderId.includes(raw) || model.includes(raw) || imei.includes(raw) || imei2.includes(raw) || cust.includes(raw);
-        });
-    }
-
-    renderInventory();
-
-    const countEl = document.getElementById('inventoryCount');
-    if (countEl) countEl.textContent = filteredInventory.length + ' phone' + (filteredInventory.length === 1 ? '' : 's');
-}
-
-function clearSearch() {
-    const searchInput = document.getElementById('inventorySearch');
-    if (searchInput) searchInput.value = '';
-    applySearch();
-}
-
-// ==========================================
-// RENDER INVENTORY
-// ==========================================
-function renderInventory() {
-    renderMobileCards();
-    renderDesktopTable();
-    refreshIcons();
-}
-
-function renderMobileCards() {
-    const container = document.getElementById('inventoryCards');
-    if (!container) return;
-
-    if (!filteredInventory.length) {
-        container.innerHTML = `
-            <div class="empty-state">
-                <i data-lucide="inbox"></i>
-                <p class="text-sm font-medium">No inventory</p>
-                <p class="text-xs text-gray-400 mt-1">Phones picked up will appear here</p>
-            </div>`;
-        return;
-    }
-
-    const srcClass = currentSource === 'cashify' ? 'cashify-src' : 'flipkart-src';
-    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
-    const pillLabel = getSourceLabel(currentSource);
-
-    let html = '';
-    filteredInventory.forEach(item => {
-        const orderId = escapeHtml(item.orderId || item.id);
-        const model = escapeHtml(item.phoneModel || '—');
-        const imei = escapeHtml(item.imei || '—');
-        const cust = escapeHtml(item.customerName || '—');
-
-        html += `
-            <div class="inventory-card ${srcClass}">
-                <div class="flex items-start justify-between gap-2 mb-2 pl-2">
-                    <div class="min-w-0 flex-1">
-                        <div class="flex items-center gap-2 flex-wrap mb-1">
-                            <span class="src-pill ${pillClass}"><span class="dot"></span>${pillLabel}</span>
-                        </div>
-                        <div class="font-mono font-bold text-gray-800 text-sm truncate">${orderId}</div>
-                        <div class="text-sm text-gray-700 font-medium truncate mt-0.5">${model}</div>
-                    </div>
-                </div>
-                <div class="pl-2 space-y-1 text-xs text-gray-500">
-                    <div class="flex items-center gap-1.5"><i data-lucide="hash" class="w-3 h-3 flex-shrink-0"></i><span class="font-mono truncate">${imei}</span></div>
-                    <div class="flex items-center gap-1.5"><i data-lucide="user" class="w-3 h-3 flex-shrink-0"></i><span class="truncate">${cust}</span></div>
-                </div>
-                <div class="flex gap-2 mt-3 pl-2">
-                    <button onclick="openSellModal('${item.id}')" class="btn-action success flex-1"><i data-lucide="badge-dollar-sign"></i> Sell</button>
-                    <button onclick="viewOrderDetail('${item.id}')" class="btn-action view" title="View"><i data-lucide="eye"></i></button>
-                </div>
-            </div>`;
-    });
-    container.innerHTML = html;
-}
-
-function renderDesktopTable() {
-    const tbody = document.getElementById('inventoryTableBody');
-    if (!tbody) return;
-
-    if (!filteredInventory.length) {
-        tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><i data-lucide="inbox"></i><p class="text-sm font-medium">No inventory</p></div></td></tr>`;
-        return;
-    }
-
-    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
-    const pillLabel = getSourceLabel(currentSource);
-
-    let html = '';
-    filteredInventory.forEach((item, idx) => {
-        const orderId = escapeHtml(item.orderId || item.id);
-        const model = escapeHtml(item.phoneModel || '—');
-        const imei = escapeHtml(item.imei || '—');
-        const cust = escapeHtml(item.customerName || '—');
-
-        html += `
-            <tr class="border-b border-gray-50 hover:bg-gray-50 transition">
-                <td class="py-3 px-4 text-gray-400 font-mono text-xs">${idx + 1}</td>
-                <td class="py-3 px-4"><span class="src-pill ${pillClass}"><span class="dot"></span>${pillLabel}</span></td>
-                <td class="py-3 px-4 font-mono font-bold text-gray-800 text-sm">${orderId}</td>
-                <td class="py-3 px-4 text-gray-600 text-sm">${model}</td>
-                <td class="py-3 px-4 font-mono text-xs text-gray-500">${imei}</td>
-                <td class="py-3 px-4 text-gray-600 text-sm">${cust}</td>
-                <td class="py-3 px-4">
-                    <div class="flex items-center gap-2">
-                        <button onclick="openSellModal('${item.id}')" class="btn-action success" style="padding:8px 14px;min-height:38px;font-size:12px;"><i data-lucide="badge-dollar-sign" style="width:16px;height:16px;"></i> Sell</button>
-                        <button onclick="viewOrderDetail('${item.id}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View"><i data-lucide="eye" style="width:16px;height:16px;"></i></button>
-                    </div>
-                </td>
-            </tr>`;
-    });
-    tbody.innerHTML = html;
-}
-
-// ==========================================
-// OVERHEAD PER PHONE
-// ==========================================
-async function computeOverheadPerPhone(source) {
-    const db = getDb(source);
-    const [usersSnap, attendanceSnap, pickupsSnap] = await Promise.all([
-        db.ref('users').once('value'),
-        db.ref('attendance').once('value'),
-        db.ref('pickups').once('value')
-    ]);
-    const users = usersSnap.val() || {};
-    const attendance = attendanceSnap.val() || {};
-    const pickups = pickupsSnap.val() || {};
-    const today = new Date();
-    let totalOverhead = 0;
-
-    for (const [uname, uData] of Object.entries(users)) {
-        const role = uData.role || 'agent';
-        if (role !== 'agent') continue;
-        const monthlySalary = Number(uData.salary) || 0;
-        if (monthlySalary <= 0) continue;
-        const perDaySalary = monthlySalary / 30;
-        let joinDate = null;
-        if (uData.joinDate) joinDate = new Date(uData.joinDate + 'T00:00:00');
-        else if (uData.createdAt) joinDate = new Date(uData.createdAt);
-        if (!joinDate || isNaN(joinDate)) joinDate = new Date(today);
-        let cur = new Date(joinDate);
-        while (cur <= today) {
-            const ds = getLocalYMD(cur);
-            const att = (attendance[uname] && attendance[uname][ds]) || {};
-            const isPresent = att.status === 'present';
-            const salaryCounted = att.salary_counted !== false;
-            if (isPresent && salaryCounted) {
-                totalOverhead += (att.half_day === true) ? perDaySalary * 0.5 : perDaySalary;
-            }
-            cur.setDate(cur.getDate() + 1);
-        }
-    }
-
-    let totalPickupIncentives = 0;
-    let totalRejectIncentives = 0;
-    Object.values(pickups).forEach(item => {
-        if (!item || item.status === 'on_hold') return;
-        const agent = item.agent;
-        if (!agent) return;
-        const uData = users[agent];
-        if (!uData || (uData.role || 'agent') !== 'agent') return;
-        if (item.status === 'pickup') totalPickupIncentives += Number(uData.pickup_incentive) || 0;
-        else if (item.status === 'rejected' && Boolean(item.incentive_approved)) totalRejectIncentives += Number(uData.reject_incentive) || 0;
-    });
-    totalOverhead += totalPickupIncentives + totalRejectIncentives;
-
-    let totalSold = 0;
-    Object.values(pickups).forEach(item => { if (item && item.status === 'pickup' && item.sold) totalSold++; });
-
-    return totalSold > 0 ? totalOverhead / totalSold : 0;
-}
-
-async function getOverheadPerPhone(source, force = false) {
-    const cached = overheadCache[source];
-    if (!force && cached && cached.value > 0 && (Date.now() - cached.ts < OVERHEAD_TTL)) return cached.value;
-    try {
-        const value = await computeOverheadPerPhone(source);
-        overheadCache[source] = { ts: Date.now(), value };
-        return value;
-    } catch (e) {
-        console.warn('Overhead calc failed:', e);
-        return cached ? cached.value : 0;
-    }
-}
-
-// ==========================================
-// SELL MODAL (unchanged)
-// ==========================================
-function openSellModal(orderId) {
-    const order = inventoryList.find(item => item.id === orderId);
-    if (!order) { showToast('Order not found in inventory', 'error'); return; }
-    sellOrderData = order;
-
-    document.getElementById('sellOrderId').value = order.orderId || order.id;
-    document.getElementById('sellModel').value = order.phoneModel || '—';
-    document.getElementById('sellImei').value = order.imei || '—';
-    document.getElementById('sellCustomer').value = order.customerName || '—';
-    document.getElementById('sellSalePrice').value = '';
-    document.getElementById('sellBuyerName').value = '';
-    document.getElementById('sellBuyerContact').value = '';
-    document.getElementById('sellSaleDate').value = getLocalYMD();
-
-    const banner = document.getElementById('sellSourceBanner');
-    if (banner) {
-        if (currentSource === 'cashify') {
-            banner.style.background = '#E6FAF6'; banner.style.color = '#0FA88B'; banner.style.border = '1px solid #a7f3d0';
-            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#12CAA7;display:inline-block;"></span>Selling from Cashify</span><span>CASHIFY</span>`;
-        } else {
-            banner.style.background = '#eef2ff'; banner.style.color = '#4338ca'; banner.style.border = '1px solid #c7d2fe';
-            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#6366f1;display:inline-block;"></span>Selling from Flipkart</span><span>FLIPKART</span>`;
-        }
-    }
-
-    const modal = document.getElementById('sellModal');
-    if (modal) modal.style.display = 'flex';
-    document.body.style.overflow = 'hidden';
-    refreshIcons();
-    setTimeout(() => { const inp = document.getElementById('sellSalePrice'); if (inp) inp.focus(); }, 300);
-}
-
-function closeSellModal() {
-    const modal = document.getElementById('sellModal');
-    if (modal) modal.style.display = 'none';
-    document.body.style.overflow = '';
-    sellOrderData = null;
-}
-
-async function confirmSell() {
-    if (!sellOrderData) return;
-    const salePriceRaw = document.getElementById('sellSalePrice').value.trim();
-    const buyerName = document.getElementById('sellBuyerName').value.trim();
-    const buyerContact = document.getElementById('sellBuyerContact').value.trim();
-    const saleDate = document.getElementById('sellSaleDate').value || getLocalYMD();
-    const salePrice = parseFloat(salePriceRaw);
-
-    if (!salePrice || salePrice <= 0 || isNaN(salePrice)) { showToast('Please enter a valid sale price', 'error'); document.getElementById('sellSalePrice').focus(); return; }
-    if (!buyerName) { showToast('Please enter buyer name', 'error'); document.getElementById('sellBuyerName').focus(); return; }
-
-    const order = sellOrderData;
-    const source = currentSource;
-    const sourceLabel = getSourceLabel(source);
-
-    const confirm = await Swal.fire({
-        title: 'Confirm Sale',
-        html: `
-            <div style="text-align:left;font-size:14px;line-height:1.7;">
-                <div style="margin-bottom:6px;">
-                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()}</span>
-                </div>
-                <p><strong>Order:</strong> ${escapeHtml(order.orderId || order.id)}</p>
-                <p><strong>Model:</strong> ${escapeHtml(order.phoneModel || '—')}</p>
-                <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
-                <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
-                <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
-            </div>`,
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#059669',
-        cancelButtonColor: '#64748b',
-        confirmButtonText: '✅ Confirm Sale',
-        cancelButtonText: 'Cancel'
-    });
-
-    if (!confirm.isConfirmed) return;
-
-    const confirmBtn = document.getElementById('confirmSellBtn');
-    const originalBtnHtml = confirmBtn ? confirmBtn.innerHTML : '';
-    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Saving…'; }
-
-    try {
-        const overhead = await getOverheadPerPhone(source, false);
-        const purchase = Number(order.value) || 0;
-
-        let writePayload = {
-            sold: true, salePrice, buyerName, buyerContact: buyerContact || '', saleDate,
-            saleTimestamp: new Date().toISOString()
-        };
-
-        if (source === 'flipkart') {
-            const commission = calculateCommission(purchase);
-            const grossProfit = salePrice - purchase - commission;
-            const finalProfit = grossProfit - overhead;
-            writePayload.commission = commission;
-            writePayload.grossProfit = grossProfit;
-            writePayload.finalNetProfit = finalProfit;
-            writePayload.profit = grossProfit;
-        } else {
-            const coins = Number(order.coins) || 0;
-            const rate = Number(order.coinValueRate) || 12.5;
-            const coinsValue = (order.coinTotalValue !== undefined && order.coinTotalValue !== null) ? Number(order.coinTotalValue) : coins * rate;
-            const actualCost = (order.actualTotalCost !== undefined && order.actualTotalCost !== null) ? Number(order.actualTotalCost) : purchase + coinsValue;
-            const grossProfit = salePrice - actualCost;
-            const finalProfit = grossProfit - overhead;
-            writePayload.grossProfit = grossProfit;
-            writePayload.finalNetProfit = finalProfit;
-        }
-
-        const db = getDb(source);
-        await db.ref('pickups/' + order.id).update(writePayload);
-        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
-        closeSellModal();
-        await loadInventory();
-    } catch (e) {
-        console.error('Sale error:', e);
-        showToast('Error saving sale. Please try again.', 'error');
-    } finally {
-        if (confirmBtn) {
-            confirmBtn.disabled = false;
-            confirmBtn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle" class="w-4 h-4"></i> Confirm Sale';
-            refreshIcons();
-        }
-    }
-}
-
-// ==========================================
-// VIEW ORDER DETAIL (unchanged)
-// ==========================================
-async function viewOrderDetail(orderId) {
-    const modal = document.getElementById('detailModal');
-    const content = document.getElementById('detailContent');
-    if (!modal || !content) return;
-    modal.style.display = 'flex';
-    document.body.style.overflow = 'hidden';
-    content.innerHTML = `<div class="text-center py-8 text-gray-400"><span class="spinner-sm"></span><p class="text-sm mt-2">Loading...</p></div>`;
-
-    try {
-        const db = getDb(currentSource);
-        const snap = await db.ref('pickups/' + orderId).once('value');
-        const item = snap.val();
-        if (!item) { content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium">Order not found</p></div>`; refreshIcons(); return; }
-
-        const statusLabel = item.status || 'unknown';
-        const isSold = item.sold === true;
-        const isReturned = item.returned === true;
-
-        let statusDisplay, statusClass;
-        if (isReturned) { statusDisplay = 'Returned'; statusClass = 'sold'; }
-        else if (isSold) { statusDisplay = 'Sold'; statusClass = 'sold'; }
-        else if (statusLabel === 'pickup') { statusDisplay = 'Pickup'; statusClass = 'available'; }
-        else if (statusLabel === 'rejected') { statusDisplay = 'Rejected'; statusClass = 'rejected'; }
-        else { statusDisplay = 'Pending'; statusClass = 'available'; }
-
-        const sourceLabel = getSourceLabel(currentSource);
-        const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
-
-        let saleHtml = '';
-        if (isSold || isReturned) {
-            saleHtml = `
-                <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${Number(item.salePrice || item.lastSalePrice || 0).toLocaleString('en-IN')}</div></div>
-                <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(item.buyerName || item.lastBuyerName || '—')}</div></div>
-                <div class="detail-item"><div class="label">Sale Date</div><div class="value">${escapeHtml(item.saleDate || item.lastSaleDate || '—')}</div></div>
-                ${isReturned ? `<div class="detail-item"><div class="label">Return Date</div><div class="value" style="color:#dc2626;">${escapeHtml(item.returnDate || '—')}</div></div>` : ''}
-            `;
-        }
-
-        const ramStorage = item.ramStorage ? escapeHtml(item.ramStorage) : (item.ram && item.storage ? escapeHtml(item.ram + ' / ' + item.storage) : '—');
-
-        content.innerHTML = `
-            <div class="flex items-center gap-2 flex-wrap mb-4">
-                <span class="badge-status ${statusClass} text-sm px-4 py-1.5">${statusDisplay}</span>
-                <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
-                <span class="font-mono font-bold text-gray-800 text-sm">${escapeHtml(item.orderId || orderId)}</span>
-            </div>
-            <div class="detail-grid">
-                <div class="detail-item"><div class="label">Phone Model</div><div class="value">${escapeHtml(item.phoneModel || '—')}</div></div>
-                <div class="detail-item"><div class="label">IMEI</div><div class="value font-mono text-xs">${escapeHtml(item.imei || '—')}</div></div>
-                ${item.imei2 ? `<div class="detail-item"><div class="label">IMEI 2</div><div class="value font-mono text-xs">${escapeHtml(item.imei2)}</div></div>` : ''}
-                <div class="detail-item"><div class="label">RAM / Storage</div><div class="value">${ramStorage}</div></div>
-                <div class="detail-item"><div class="label">Network</div><div class="value">${escapeHtml(item.networkType || '—')}</div></div>
-                <div class="detail-item"><div class="label">Customer</div><div class="value">${escapeHtml(item.customerName || '—')}</div></div>
-                <div class="detail-item"><div class="label">Reason</div><div class="value">${escapeHtml(item.reason || '—')}</div></div>
-                <div class="detail-item"><div class="label">Time (IST)</div><div class="value text-xs">${escapeHtml(item.timestampIST || item.timestamp || '—')}</div></div>
-                ${item.agent ? `<div class="detail-item"><div class="label">Agent</div><div class="value">${escapeHtml(item.agent)}</div></div>` : ''}
-                ${saleHtml}
-            </div>`;
-        refreshIcons();
-    } catch (err) {
-        console.error('Detail load error:', err);
-        content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Error loading details</p></div>`;
-        refreshIcons();
-        showToast('Error loading order details', 'error');
-    }
-}
-
-function closeDetailModal() {
-    const modal = document.getElementById('detailModal');
-    if (modal) modal.style.display = 'none';
-    document.body.style.overflow = '';
-}
-
-// ==========================================
-// REFRESH
-// ==========================================
-async function refreshInventory() {
-    if (isRefreshing) return;
-    isRefreshing = true;
-    showToast('🔄 Refreshing…', 'info', 1200);
-    overheadCache[currentSource] = { ts: 0, value: 0 };
-
-    if (currentView === 'returns') {
-        await Promise.all([loadReturnsView(), loadReturnsHistory()]);
-    } else {
-        await loadInventory();
-    }
-
-    isRefreshing = false;
-    showToast('✅ Refreshed', 'success', 1500);
-}
-
-// ================================================================
-// ================================================================
-// ============ RETURNS SYSTEM (NEW) ==============================
-// ================================================================
-// ================================================================
-
-// ==========================================
-// INVENTORY COUNTS (both platforms, live from data)
-// ==========================================
-async function getInventoryCount(source) {
-    try {
-        const db = getDb(source);
-        const snap = await db.ref('pickups').once('value');
-        const data = snap.val() || {};
-        let count = 0;
+        const today = new Date().toDateString();
+        const snapshot = await db.ref('pickups').orderByChild('agent').equalTo(currentUser.username).once('value');
+        const data = snapshot.val() || {};
+        let pickup = 0, reject = 0, reschedule = 0;
         Object.values(data).forEach(item => {
-            if (item && item.status === 'pickup' && !item.sold) count++;
+            if (new Date(item.timestamp).toDateString() === today) {
+                if (item.status === 'pickup') pickup++;
+                else if (item.status === 'rejected') reject++;
+                else if (item.status === 'reschedule') reschedule++;
+            }
         });
-        return count;
-    } catch (e) {
-        console.warn('Count error for ' + source, e);
-        return 0;
-    }
+        document.getElementById('statPickup').textContent = pickup;
+        document.getElementById('statReject').textContent = reject;
+        document.getElementById('statReschedule').textContent = reschedule;
+    } catch (e) { console.log(e); }
 }
 
-async function loadInventoryCounts() {
-    const [fk, cf] = await Promise.all([getInventoryCount('flipkart'), getInventoryCount('cashify')]);
-    const fkEl = document.getElementById('flipkartInvCount');
-    const cfEl = document.getElementById('cashifyInvCount');
-    if (fkEl) fkEl.textContent = fk;
-    if (cfEl) cfEl.textContent = cf;
-    return { flipkart: fk, cashify: cf };
-}
-
-// ==========================================
-// RETURNS VIEW LOAD
-// ==========================================
-async function loadReturnsView() {
-    updateReturnsBanner();
-    await loadInventoryCounts();
-    returnSearchResults = [];
-    selectedReturnPhone = null;
-    const rSearch = document.getElementById('returnSearch');
-    if (rSearch) rSearch.value = '';
-    const rResults = document.getElementById('returnSearchResults');
-    if (rResults) rResults.innerHTML = '';
-    const rForm = document.getElementById('returnFormSection');
-    if (rForm) { rForm.style.display = 'none'; rForm.innerHTML = ''; }
-}
-
-function updateReturnsBanner() {
-    const banner = document.getElementById('returnsBanner');
-    const title = document.getElementById('returnsBannerTitle');
-    const subtitle = document.getElementById('returnsBannerSubtitle');
-    const icon = document.getElementById('returnsBannerIcon');
-    const iconBg = document.getElementById('returnsBannerIconBg');
-    if (!banner) return;
-
-    if (currentSource === 'cashify') {
-        banner.style.borderLeftColor = '#12CAA7';
-        if (icon) icon.style.color = '#0FA88B';
-        if (iconBg) iconBg.style.background = '#E6FAF6';
-        if (title) title.textContent = 'Cashify Returns';
-        if (subtitle) subtitle.textContent = 'Search and process return of Cashify-sold phones';
-    } else {
-        banner.style.borderLeftColor = '#6366f1';
-        if (icon) icon.style.color = '#6366f1';
-        if (iconBg) iconBg.style.background = '#eef2ff';
-        if (title) title.textContent = 'Flipkart Returns';
-        if (subtitle) subtitle.textContent = 'Search and process return of Flipkart-sold phones';
-    }
-}
-
-// ==========================================
-// SEARCH SOLD PHONES
-// ==========================================
-async function searchSoldPhones() {
-    const input = document.getElementById('returnSearch');
-    const query = (input ? input.value : '').trim();
-    if (!query) { showToast('Enter IMEI or model to search', 'error'); return; }
-
-    const resultsEl = document.getElementById('returnSearchResults');
-    if (resultsEl) resultsEl.innerHTML = `<div class="glass rounded-2xl p-6 text-center text-gray-400 text-sm"><span class="spinner-sm"></span> Searching...</div>`;
-
+// === SECTION 13: PENDING ORDERS ===
+async function loadPendingOrders() {
+    if (!currentUser) return;
     try {
-        const db = getDb(currentSource);
-        const snap = await db.ref('pickups').once('value');
-        const data = snap.val() || {};
-
-        const lower = query.toLowerCase();
-        const digits = query.replace(/\D/g, '');
-
-        returnSearchResults = Object.entries(data)
-            .filter(([_, item]) => {
-                if (!item) return false;
-                if (item.status !== 'pickup') return false;
-                if (item.sold !== true) return false;
-                if (item.returned === true) return false; // already returned
-                return true;
-            })
-            .map(([id, item]) => ({ id, ...item }))
-            .filter(item => {
-                const imei = String(item.imei || '');
-                const imei2 = String(item.imei2 || '');
-                const model = String(item.phoneModel || '').toLowerCase();
-                const orderId = String(item.orderId || item.id || '').toLowerCase();
-
-                if (model.includes(lower)) return true;
-                if (orderId.includes(lower)) return true;
-                if (imei.includes(query) || imei2.includes(query)) return true;
-                if (digits.length >= 4) {
-                    if (imei.endsWith(digits) || imei2.endsWith(digits)) return true;
-                }
-                return false;
-            })
-            .sort((a, b) => {
-                const ta = new Date(a.saleTimestamp || a.timestamp || 0).getTime() || 0;
-                const tb = new Date(b.saleTimestamp || b.timestamp || 0).getTime() || 0;
-                return tb - ta;
-            });
-
-        renderReturnSearchResults();
+        const snapshot = await db.ref('pending').orderByChild('agent').equalTo(currentUser.username).once('value');
+        const data = snapshot.val() || {};
+        allPendingOrders = [];
+        for (const [orderId, item] of Object.entries(data || {})) {
+            allPendingOrders.push({ orderId, ...item });
+        }
+        allPendingOrders.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        renderPendingList();
+        updatePendingCounts();
     } catch (e) {
-        console.error('Search error:', e);
-        if (resultsEl) resultsEl.innerHTML = `<div class="glass rounded-2xl p-6 text-center text-red-500 text-sm">Error searching. Please try again.</div>`;
-        showToast('Search failed', 'error');
+        console.log(e);
+        document.getElementById('pendingList').innerHTML = '<div class="pending-empty"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Error loading</p></div>';
+        lucide.createIcons();
     }
 }
 
-function clearReturnSearch() {
-    const rSearch = document.getElementById('returnSearch');
-    if (rSearch) rSearch.value = '';
-    returnSearchResults = [];
-    selectedReturnPhone = null;
-    const rResults = document.getElementById('returnSearchResults');
-    if (rResults) rResults.innerHTML = '';
-    const rForm = document.getElementById('returnFormSection');
-    if (rForm) { rForm.style.display = 'none'; rForm.innerHTML = ''; }
+function updatePendingCounts() {
+    const count = allPendingOrders.length;
+    document.getElementById('pendingCountBadge').textContent = count;
+    document.getElementById('pendingCountBadgeMain').textContent = count;
+    document.getElementById('pendingCountBadge').style.display = count > 0 ? 'inline-block' : 'none';
+    document.getElementById('pendingCountBadgeMain').style.display = count > 0 ? 'inline-block' : 'none';
 }
 
-function renderReturnSearchResults() {
-    const container = document.getElementById('returnSearchResults');
-    if (!container) return;
+function setPendingFilter(filter) {
+    pendingFilter = filter;
+    document.querySelectorAll('#pendingTabBar button').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === filter);
+    });
+    renderPendingList();
+}
 
-    if (!returnSearchResults.length) {
-        container.innerHTML = `<div class="glass rounded-2xl p-6 text-center text-gray-400 text-sm">
-            <i data-lucide="search-x" class="w-6 h-6 mx-auto mb-2" style="color:#cbd5e1;"></i>
-            No matching sold phones found.<br>Try a different IMEI (last 4 / full) or model name.
-        </div>`;
-        refreshIcons();
+function renderPendingList() {
+    const container = document.getElementById('pendingList');
+    let filtered = [...allPendingOrders];
+    if (pendingFilter === 'onway') {
+        filtered = filtered.filter(item => item.reason && item.reason.toLowerCase().includes('on the way'));
+    }
+    if (filtered.length === 0) {
+        const msg = pendingFilter === 'onway' ? 'No "On the way" orders' : 'No pending orders';
+        container.innerHTML = `
+            <div class="pending-empty">
+                <i data-lucide="inbox"></i>
+                <p class="text-sm font-medium">${msg}</p>
+                <p class="text-xs text-gray-400 mt-1">Orders you reschedule will appear here</p>
+            </div>`;
+        lucide.createIcons();
         return;
     }
-
-    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
-    const sourceLabel = getSourceLabel(currentSource);
-
-    let html = `<div class="glass rounded-2xl p-3 shadow-sm border border-gray-100 space-y-2">`;
-    html += `<p class="text-xs font-bold text-gray-500 px-2 py-1">${returnSearchResults.length} matching sold phone${returnSearchResults.length > 1 ? 's' : ''}</p>`;
-    returnSearchResults.forEach(item => {
-        const salePrice = Number(item.salePrice) || 0;
-        const saleDate = item.saleDate || (item.saleTimestamp ? getLocalYMD(new Date(item.saleTimestamp)) : '—');
+    let html = '';
+    filtered.forEach(item => {
+        const isOnWay = item.reason && item.reason.toLowerCase().includes('on the way');
+        const badge = isOnWay ? '<span class="badge-onway">🚗 On the way</span>' : '<span class="badge-pending">⏳ Pending</span>';
+        const time = item.timestampIST || item.timestamp || '';
+        const reason = item.reason || '—';
+        const model = item.phoneModel || '—';
         html += `
-            <div class="return-result-card" onclick="selectReturnPhone('${item.id}')">
-                <div class="flex items-start justify-between gap-2 mb-1">
-                    <div class="min-w-0 flex-1">
-                        <div class="font-mono font-bold text-gray-800 text-sm truncate">${escapeHtml(item.orderId || item.id)}</div>
-                        <div class="text-sm text-gray-700 font-medium truncate mt-0.5">${escapeHtml(item.phoneModel || '—')}</div>
+            <div class="pending-item glass rounded-xl p-4 mb-3 shadow">
+                <div class="flex items-start justify-between">
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <span class="font-mono font-bold text-gray-800 text-sm">${item.orderId}</span>
+                            ${badge}
+                            <span class="text-xs text-gray-400">(${model})</span>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1"><i data-lucide="message-circle" class="w-3 h-3 inline"></i> ${reason}</p>
+                        <p class="text-xs text-gray-400 mt-0.5"><i data-lucide="clock" class="w-3 h-3 inline"></i> ${time}</p>
                     </div>
-                    <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
-                </div>
-                <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mt-1">
-                    <span><i data-lucide="hash" class="w-3 h-3 inline"></i> ${escapeHtml(item.imei || '—')}</span>
-                    <span class="text-green-700 font-semibold">₹${salePrice.toLocaleString('en-IN')}</span>
-                    <span>${escapeHtml(saleDate)}</span>
+                    <button onclick="markPendingDone('${item.orderId}')" class="done-btn flex-shrink-0 ml-3">
+                        <i data-lucide="check-circle"></i> Done
+                    </button>
                 </div>
             </div>`;
     });
-    html += `</div>`;
     container.innerHTML = html;
-    refreshIcons();
+    lucide.createIcons();
 }
 
-// ==========================================
-// SELECT RETURN PHONE
-// ==========================================
-function selectReturnPhone(pickupId) {
-    const item = returnSearchResults.find(r => r.id === pickupId);
-    if (!item) { showToast('Phone not found in results', 'error'); return; }
-    selectedReturnPhone = item;
-    renderReturnForm();
+function markPendingDone(orderId) {
+    pendingDoneOrderId = orderId;
+    document.getElementById('orderId').value = orderId;
+    switchTab('pickup');
+    showForm('pickup');
+    showToast(`📦 Pending order ${orderId} — fill pickup details`, 'info');
 }
 
-function cancelReturnSelection() {
-    selectedReturnPhone = null;
-    const rForm = document.getElementById('returnFormSection');
-    if (rForm) { rForm.style.display = 'none'; rForm.innerHTML = ''; }
+// === SECTION 14: PASTE ORDER ID ===
+async function pasteOrderId() {
+    try {
+        const text = await navigator.clipboard.readText();
+        document.getElementById('orderId').value = text.trim().toUpperCase();
+        showToast('Pasted!', 'success');
+    } catch (e) {
+        showToast('Cannot access clipboard', 'error');
+    }
 }
 
-// ==========================================
-// RENDER RETURN FORM
-// ==========================================
-function renderReturnForm() {
-    const section = document.getElementById('returnFormSection');
-    if (!section) return;
+// === SECTION 15: SHOW FORM ===
+let backNavigationReady = false;
 
-    if (!selectedReturnPhone) {
-        section.style.display = 'none';
-        section.innerHTML = '';
+function setupBackNavigation() {
+    if (backNavigationReady) return;
+    backNavigationReady = true;
+    history.replaceState({ view: 'order' }, '', window.location.href);
+    window.addEventListener('popstate', () => {
+        const scannerModal = document.getElementById('scannerModal');
+        if (scannerModal && !scannerModal.classList.contains('hidden')) {
+            stopScanner(); return;
+        }
+        const stepForm = document.getElementById('step-form');
+        if (stepForm && !stepForm.classList.contains('hidden')) goBack();
+    });
+}
+
+function goBack() {
+    const stepOrder = document.getElementById('step-order');
+    const stepForm = document.getElementById('step-form');
+    if (stepForm && !stepForm.classList.contains('hidden')) {
+        stepForm.classList.add('hidden');
+        stepOrder.classList.remove('hidden');
+        currentStatus = ''; selectedReason = ''; hiddenImei2 = '';
+        const orderInput = document.getElementById('orderId');
+        if (orderInput) orderInput.focus();
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        history.replaceState({ view: 'order' }, '', window.location.href);
+        return true;
+    }
+    return false;
+}
+
+function showForm(status) {
+    clearPickupImageState();
+    resetSpecSelection();
+    let orderId = document.getElementById('orderId').value.trim().toUpperCase();
+    if (!orderId && pendingDoneOrderId) {
+        orderId = pendingDoneOrderId;
+        document.getElementById('orderId').value = orderId;
+    }
+    if (!orderId) {
+        Swal.fire({ icon: 'warning', title: 'Order ID Missing', text: 'Please enter the Order ID first', confirmButtonColor: '#3b82f6' });
+        document.getElementById('orderId').focus();
         return;
     }
+    pendingDoneOrderId = null;
+    currentStatus = status; selectedReason = ''; hiddenImei2 = '';
+    document.getElementById('step-order').classList.add('hidden');
+    document.getElementById('step-form').classList.remove('hidden');
+    document.getElementById('displayOrderId').textContent = orderId;
+    history.pushState({ view: 'form', status }, '', window.location.href);
 
-    const phone = selectedReturnPhone;
-    const sourceLabel = getSourceLabel(currentSource);
-    const pillClass = currentSource === 'cashify' ? 'cashify' : 'flipkart';
-    const salePrice = Number(phone.salePrice) || 0;
-    const saleDate = phone.saleDate || (phone.saleTimestamp ? getLocalYMD(new Date(phone.saleTimestamp)) : '—');
+    const formFields = document.getElementById('formFields');
+    const formTitle = document.getElementById('formTitle');
+    const formSubtitle = document.getElementById('formSubtitle');
+    const formIcon = document.getElementById('formIcon');
+    const submitBtn = document.getElementById('submitBtn');
+    formFields.innerHTML = '';
 
-    section.style.display = 'block';
-    section.innerHTML = `
-        <div class="flex items-center justify-between mb-3">
-            <h4 class="font-bold text-gray-800 text-sm flex items-center gap-2">
-                <i data-lucide="corner-down-left" class="w-4 h-4 text-red-600"></i>
-                Process Return
-            </h4>
-            <button onclick="cancelReturnSelection()" class="text-xs text-red-600 font-semibold hover:underline">Cancel</button>
-        </div>
-
-        <!-- Selected Phone Details -->
-        <div class="mb-4">
-            <div class="flex items-center gap-2 flex-wrap mb-2">
-                <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
-                <span class="font-mono font-bold text-gray-800 text-sm">${escapeHtml(phone.orderId || phone.id)}</span>
+    if (status === 'pickup') {
+        formTitle.innerText = "Pickup Details";
+        formSubtitle.innerText = "Fill device information";
+        formIcon.className = "w-12 h-12 rounded-xl flex items-center justify-center bg-gradient-to-br from-green-500 to-emerald-600";
+        formIcon.innerHTML = '<i data-lucide="check-circle-2" class="w-7 h-7 text-white"></i>';
+        submitBtn.className = 'btn-bounce w-full bg-gradient-to-r from-green-500 to-emerald-600 text-white p-4 rounded-2xl font-bold text-lg shadow-xl flex items-center justify-center gap-2';
+        formFields.innerHTML = `
+            <div>
+                <label class="text-xs font-bold text-gray-500 mb-1.5 block">PHONE MODEL *</label>
+                <input type="text" id="phoneModel" placeholder="e.g., iPhone 12, Samsung S21" class="input-field w-full p-3.5 rounded-xl outline-none">
             </div>
-            <div class="detail-grid">
-                <div class="detail-item">
-                    <div class="label">Phone Model</div>
-                    <div class="value">${escapeHtml(phone.phoneModel || '—')}</div>
+            <div>
+                <label class="text-xs font-bold text-gray-500 mb-1.5 block">IMEI NUMBER *</label>
+                <div class="relative">
+                    <input type="text" id="imei" placeholder="15-digit IMEI" class="input-field w-full p-3.5 rounded-xl outline-none pr-28 font-mono" inputmode="numeric" maxlength="15">
+                    <button onclick="startScanner()" class="btn-scan-imei absolute right-1.5 top-1/2 -translate-y-1/2">
+                        <i data-lucide="scan-line"></i> Scan
+                    </button>
                 </div>
-                <div class="detail-item">
-                    <div class="label">IMEI</div>
-                    <div class="value font-mono text-xs">${escapeHtml(phone.imei || '—')}</div>
+                <p class="text-xs text-gray-400 mt-1.5 flex items-center gap-1">
+                    <span>📱</span>
+                    <span>Barcode scan karo ya <strong>*#06#</strong> screen — Capture dabao, fatafat ho jaega!</span>
+                </p>
+            </div>
+            <div>
+                <label class="text-xs font-bold text-gray-500 mb-1.5 block">AGREED VALUE (₹) *</label>
+                <div class="relative">
+                    <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 font-bold">₹</span>
+                    <input type="number" id="value" placeholder="0" class="input-field w-full p-3.5 pl-8 rounded-xl outline-none font-bold text-lg" inputmode="numeric">
                 </div>
-                <div class="detail-item">
-                    <div class="label">Original Sale Price</div>
-                    <div class="value green">₹${salePrice.toLocaleString('en-IN')}</div>
+            </div>
+            <div>
+                <label class="text-xs font-bold text-gray-500 mb-1.5 block">CUSTOMER NAME <span class="text-gray-400">(Optional)</span></label>
+                <input type="text" id="custName" placeholder="Enter name" class="input-field w-full p-3.5 rounded-xl outline-none">
+            </div>
+
+            <div class="pt-2 border-t border-gray-100">
+                <p class="text-xs font-bold text-gray-500 mb-3 tracking-wide">⚙️ DEVICE SPECS <span class="text-red-500 font-bold">(Required)</span></p>
+
+                <div class="spec-group">
+                    <div class="spec-label"><span class="t">RAM *</span><span class="picked empty" id="ramPick">Not selected</span></div>
+                    <div class="chip-grid">${buildSpecChips('ram', RAM_OPTIONS)}</div>
                 </div>
-                <div class="detail-item">
-                    <div class="label">Original Sale Date</div>
-                    <div class="value">${escapeHtml(saleDate)}</div>
+
+                <div class="spec-group mt-4">
+                    <div class="spec-label"><span class="t">STORAGE (ROM) *</span><span class="picked empty" id="storagePick">Not selected</span></div>
+                    <div class="chip-grid">${buildSpecChips('storage', STORAGE_OPTIONS)}</div>
                 </div>
-                ${phone.buyerName ? `<div class="detail-item full"><div class="label">Buyer</div><div class="value">${escapeHtml(phone.buyerName)}</div></div>` : ''}
+
+                <div class="spec-group mt-4">
+                    <div class="spec-label"><span class="t">NETWORK *</span><span class="picked empty" id="networkPick">Not selected</span></div>
+                    <div class="chip-grid cols-5">${buildSpecChips('network', NETWORK_OPTIONS, 'net')}</div>
+                </div>
+
+                <div class="spec-summary" id="specSummary"></div>
+                <input type="hidden" id="ramStorage" value="">
+                <input type="hidden" id="networkType" value="">
             </div>
-        </div>
 
-        <hr class="my-4 border-gray-100">
+            <div class="pt-2 border-t border-gray-100">
+                <p class="text-xs font-bold text-gray-500 mb-2 tracking-wide">📄 DOCUMENTS <span class="text-gray-400 font-medium">(All Optional)</span></p>
 
-        <!-- Return Date -->
-        <div class="mb-3">
-            <label class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Return Date</label>
-            <input type="date" id="returnDate" class="input-field" value="${getLocalYMD()}" />
-        </div>
-
-        <!-- Settlement Type -->
-        <div class="mb-3">
-            <label class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Return Settlement *</label>
-            <div class="flex flex-col sm:flex-row gap-2 mt-1">
-                <label class="return-type-label selected-money" id="returnTypeMoneyLabel">
-                    <input type="radio" name="returnType" value="money" checked onchange="onReturnTypeChange()" />
-                    <span>💵 Money Given</span>
-                </label>
-                <label class="return-type-label" id="returnTypeExchangeLabel">
-                    <input type="radio" name="returnType" value="exchange" onchange="onReturnTypeChange()" />
-                    <span>📱 Phone Exchange</span>
-                </label>
-            </div>
-        </div>
-
-        <!-- Money Section -->
-        <div id="moneySection">
-            <label class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Amount Returned to Customer (₹) *</label>
-            <input type="number" id="returnAmount" class="input-field" placeholder="Enter amount returned" min="0" step="1" />
-        </div>
-
-        <!-- Exchange Section -->
-        <div id="exchangeSection" style="display:none;">
-            <label class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Exchange Phone Source *</label>
-            <div class="flex gap-2 mt-1 mb-3">
-                <button type="button" onclick="onExchangeSourceChange('flipkart')" id="exSrcFlipkart" class="exchange-src-btn" style="border-color:#6366f1;background:#eef2ff;color:#4338ca;">Flipkart</button>
-                <button type="button" onclick="onExchangeSourceChange('cashify')" id="exSrcCashify" class="exchange-src-btn">Cashify</button>
-            </div>
-            <label class="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1 block">Select Exchange Phone *</label>
-            <select id="exchangePhoneSelect" class="input-field" onchange="onExchangePhoneSelect()">
-                <option value="">Loading...</option>
-            </select>
-            <div id="exchangePhoneDetails" class="mt-3"></div>
-        </div>
-
-        <!-- Submit -->
-        <div class="flex gap-2 mt-4">
-            <button onclick="cancelReturnSelection()" class="btn-action view flex-1">Cancel</button>
-            <button onclick="submitReturn()" id="processReturnBtn" class="btn-action success flex-1">
-                <i data-lucide="check-circle"></i> Process Return
-            </button>
-        </div>
-    `;
-
-    refreshIcons();
-    onExchangeSourceChange('flipkart'); // load exchange inventory
-}
-
-function onReturnTypeChange() {
-    const type = document.querySelector('input[name="returnType"]:checked')?.value || 'money';
-    const moneySection = document.getElementById('moneySection');
-    const exchangeSection = document.getElementById('exchangeSection');
-    const moneyLabel = document.getElementById('returnTypeMoneyLabel');
-    const exchangeLabel = document.getElementById('returnTypeExchangeLabel');
-
-    if (moneySection) moneySection.style.display = type === 'money' ? 'block' : 'none';
-    if (exchangeSection) exchangeSection.style.display = type === 'exchange' ? 'block' : 'none';
-
-    if (moneyLabel) moneyLabel.classList.toggle('selected-money', type === 'money');
-    if (exchangeLabel) exchangeLabel.classList.toggle('selected-exchange', type === 'exchange');
-}
-
-async function onExchangeSourceChange(source) {
-    exchangeSource = source;
-    const fkBtn = document.getElementById('exSrcFlipkart');
-    const cfBtn = document.getElementById('exSrcCashify');
-
-    if (fkBtn) {
-        fkBtn.style.cssText = `flex:1;padding:10px;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit;transition:all 0.2s;border:2px solid ${source === 'flipkart' ? '#6366f1' : '#e2e8f0'};background:${source === 'flipkart' ? '#eef2ff' : '#fff'};color:${source === 'flipkart' ? '#4338ca' : '#64748b'};`;
-    }
-    if (cfBtn) {
-        cfBtn.style.cssText = `flex:1;padding:10px;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit;transition:all 0.2s;border:2px solid ${source === 'cashify' ? '#12CAA7' : '#e2e8f0'};background:${source === 'cashify' ? '#E6FAF6' : '#fff'};color:${source === 'cashify' ? '#0FA88B' : '#64748b'};`;
-    }
-
-    await loadExchangeInventory(source);
-}
-
-async function loadExchangeInventory(source) {
-    const select = document.getElementById('exchangePhoneSelect');
-    if (!select) return;
-    select.innerHTML = '<option value="">Loading...</option>';
-
-    try {
-        const db = getDb(source);
-        const snap = await db.ref('pickups').once('value');
-        const data = snap.val() || {};
-
-        exchangeInventoryList = Object.entries(data)
-            .filter(([_, item]) => item && item.status === 'pickup' && !item.sold)
-            .map(([id, item]) => ({
-                id,
-                orderId: item.orderId || id,
-                model: item.phoneModel || '—',
-                imei: item.imei || '—',
-                value: Number(item.value) || 0,
-                source
-            }))
-            .sort((a, b) => String(a.model).localeCompare(String(b.model)));
-
-        if (!exchangeInventoryList.length) {
-            select.innerHTML = `<option value="">No phones available in ${source === 'cashify' ? 'Cashify' : 'Flipkart'} inventory</option>`;
-            return;
-        }
-
-        select.innerHTML = '<option value="">-- Select a phone from ' + (source === 'cashify' ? 'Cashify' : 'Flipkart') + ' --</option>' +
-            exchangeInventoryList.map(p => `<option value="${p.id}">${escapeHtml(p.orderId)} | ${escapeHtml(p.model)} | ${escapeHtml(p.imei)} | ₹${p.value.toLocaleString('en-IN')}</option>`).join('');
-    } catch (e) {
-        console.error('Load exchange inventory error:', e);
-        select.innerHTML = '<option value="">Error loading inventory</option>';
-    }
-}
-
-function onExchangePhoneSelect() {
-    const select = document.getElementById('exchangePhoneSelect');
-    const detailsEl = document.getElementById('exchangePhoneDetails');
-    if (!select || !detailsEl) return;
-
-    const id = select.value;
-    if (!id) { detailsEl.innerHTML = ''; return; }
-
-    const phone = exchangeInventoryList.find(p => p.id === id);
-    if (!phone) { detailsEl.innerHTML = ''; return; }
-
-    detailsEl.innerHTML = `
-        <div class="detail-grid">
-            <div class="detail-item"><div class="label">Order ID</div><div class="value font-mono text-xs">${escapeHtml(phone.orderId)}</div></div>
-            <div class="detail-item"><div class="label">Model</div><div class="value">${escapeHtml(phone.model)}</div></div>
-            <div class="detail-item"><div class="label">IMEI</div><div class="value font-mono text-xs">${escapeHtml(phone.imei)}</div></div>
-            <div class="detail-item"><div class="label">Source</div><div class="value">${phone.source === 'cashify' ? 'Cashify' : 'Flipkart'}</div></div>
-        </div>
-    `;
-}
-
-// ==========================================
-// SUBMIT RETURN
-// ==========================================
-async function submitReturn() {
-    if (isProcessingReturn) return;
-    if (!selectedReturnPhone) { showToast('Please select a sold phone first', 'error'); return; }
-
-    const returnDate = document.getElementById('returnDate').value || getLocalYMD();
-    const type = document.querySelector('input[name="returnType"]:checked')?.value || 'money';
-
-    let returnAmount = 0;
-    let exchangePickupId = null;
-    let exchangePhone = null;
-    let exchangeSrc = null;
-
-    if (type === 'money') {
-        returnAmount = parseFloat(document.getElementById('returnAmount').value);
-        if (!returnAmount || returnAmount <= 0 || isNaN(returnAmount)) { showToast('Enter a valid return amount', 'error'); document.getElementById('returnAmount').focus(); return; }
-    } else {
-        exchangeSrc = exchangeSource;
-        exchangePickupId = document.getElementById('exchangePhoneSelect').value;
-        if (!exchangePickupId) { showToast('Please select an exchange phone', 'error'); return; }
-        exchangePhone = exchangeInventoryList.find(p => p.id === exchangePickupId);
-        if (!exchangePhone) { showToast('Exchange phone not found', 'error'); return; }
-    }
-
-    const original = selectedReturnPhone;
-    const source = currentSource;
-    const sourceLabel = getSourceLabel(source);
-    const originalSalePrice = Number(original.salePrice) || 0;
-
-    // Confirm dialog
-    const confirmHtml = `
-        <div style="text-align:left;font-size:13px;line-height:1.6;">
-            <div style="margin-bottom:8px;">
-                <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()} RETURN</span>
-            </div>
-            <p><strong>Order:</strong> ${escapeHtml(original.orderId || original.id)}</p>
-            <p><strong>Model:</strong> ${escapeHtml(original.phoneModel || '—')}</p>
-            <p><strong>IMEI:</strong> ${escapeHtml(original.imei || '—')}</p>
-            <p><strong>Original Sale:</strong> ₹${originalSalePrice.toLocaleString('en-IN')}</p>
-            <hr style="margin:8px 0;">
-            <p><strong>Return Date:</strong> ${escapeHtml(returnDate)}</p>
-            ${type === 'money'
-                ? `<p><strong>Return Amount:</strong> ₹${returnAmount.toLocaleString('en-IN')} (Cash to customer)</p>`
-                : `<p><strong>Exchange Phone:</strong> ${escapeHtml(exchangePhone.model)} (${escapeHtml(exchangePhone.imei)})</p>
-                   <p><strong>Exchange Source:</strong> ${exchangeSrc === 'cashify' ? 'Cashify' : 'Flipkart'}</p>`}
-            <p style="margin-top:8px;color:#dc2626;font-size:12px;"><strong>⚠️ Inventory will be updated automatically.</strong></p>
-        </div>`;
-
-    const confirm = await Swal.fire({
-        title: 'Confirm Return Processing',
-        html: confirmHtml,
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#dc2626',
-        cancelButtonColor: '#64748b',
-        confirmButtonText: '✅ Yes, Process Return',
-        cancelButtonText: 'Cancel'
-    });
-    if (!confirm.isConfirmed) return;
-
-    isProcessingReturn = true;
-    const btn = document.getElementById('processReturnBtn');
-    const originalBtnHtml = btn ? btn.innerHTML : '';
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Processing...'; }
-
-    try {
-        const originalDb = getDb(source);
-
-        // Safety re-check: still valid?
-        const freshSnap = await originalDb.ref('pickups/' + original.id).once('value');
-        const fresh = freshSnap.val();
-        if (!fresh || fresh.sold !== true || fresh.returned === true) {
-            showToast('This phone is no longer eligible for return', 'error');
-            return;
-        }
-
-        const returnId = 'ret_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
-
-        // Build return record
-        const returnRecord = {
-            returnId,
-            source,
-            originalPickupId: original.id,
-            originalOrderId: original.orderId || original.id,
-            originalModel: original.phoneModel || '—',
-            originalImei: original.imei || '—',
-            originalSalePrice,
-            originalSaleDate: original.saleDate || (original.saleTimestamp ? getLocalYMD(new Date(original.saleTimestamp)) : '—'),
-            originalBuyerName: original.buyerName || '',
-            returnDate,
-            returnType: type,
-            returnAmount: type === 'money' ? returnAmount : 0,
-            exchangePhoneSource: type === 'exchange' ? exchangeSrc : null,
-            exchangePickupId: type === 'exchange' ? exchangePickupId : null,
-            exchangeOrderId: type === 'exchange' ? exchangePhone.orderId : null,
-            exchangeModel: type === 'exchange' ? exchangePhone.model : null,
-            exchangeImei: type === 'exchange' ? exchangePhone.imei : null,
-            createdAt: Date.now(),
-            createdBy: 'sales-manager'
-        };
-
-        // 1) Save return record first
-        await originalDb.ref('returns/' + returnId).set(returnRecord);
-
-        // 2) Update original phone (back to inventory)
-        await originalDb.ref('pickups/' + original.id).update({
-            sold: false,
-            returned: true,
-            returnDate,
-            returnId,
-            lastSalePrice: originalSalePrice,
-            lastSaleDate: original.saleDate || '',
-            lastBuyerName: original.buyerName || '',
-            salePrice: null,
-            buyerName: null,
-            buyerContact: null,
-            saleDate: null,
-            saleTimestamp: null,
-            grossProfit: null,
-            finalNetProfit: null,
-            profit: null,
-            commission: null
-        });
-
-        // 3) Update exchange phone (mark as sold/given in exchange)
-        if (type === 'exchange') {
-            const exchangeDb = getDb(exchangeSrc);
-            const exchangePayload = {
-                sold: true,
-                salePrice: 0,
-                buyerName: 'Exchange for ' + (original.orderId || original.id),
-                buyerContact: '',
-                saleDate: returnDate,
-                saleTimestamp: new Date().toISOString(),
-                soldVia: 'exchange',
-                exchangeForReturnId: returnId,
-                exchangeForOrderId: original.orderId || original.id
-            };
-            if (exchangeSrc === 'flipkart') {
-                exchangePayload.commission = 0;
-                exchangePayload.grossProfit = 0;
-                exchangePayload.finalNetProfit = 0;
-                exchangePayload.profit = 0;
-            } else {
-                exchangePayload.grossProfit = 0;
-                exchangePayload.finalNetProfit = 0;
-            }
-            await exchangeDb.ref('pickups/' + exchangePickupId).update(exchangePayload);
-        }
-
-        // 4) Get updated counts (live from actual data)
-        const counts = await loadInventoryCounts();
-
-        // 5) Update return record with counts
-        await originalDb.ref('returns/' + returnId).update({
-            inventoryCountFlipkart: counts.flipkart,
-            inventoryCountCashify: counts.cashify
-        });
-        returnRecord.inventoryCountFlipkart = counts.flipkart;
-        returnRecord.inventoryCountCashify = counts.cashify;
-
-        // 6) Build WhatsApp message
-        const message = buildReturnMessage(returnRecord);
-        lastReturnMessage = message;
-
-        // 7) Refresh UI
-        cancelReturnSelection();
-        returnSearchResults = [];
-        renderReturnSearchResults();
-        await Promise.all([loadInventory(), loadReturnsHistory()]);
-
-        // 8) Show success modal
-        showReturnSuccessModal(message);
-
-    } catch (e) {
-        console.error('Return processing error:', e);
-        showToast('Error processing return. Please try again.', 'error');
-    } finally {
-        isProcessingReturn = false;
-        if (btn) {
-            btn.disabled = false;
-            btn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle"></i> Process Return';
-            refreshIcons();
-        }
-    }
-}
-
-// ==========================================
-// WHATSAPP MESSAGE BUILDER
-// ==========================================
-function buildReturnMessage(r) {
-    const L = [];
-    L.push('🔄 *RETURN*');
-    L.push('');
-    L.push(`📋 Order ID: ${r.originalOrderId}`);
-    L.push(`📱 Model: ${r.originalModel}`);
-    L.push(`💰 Sale Amount: ₹${(Number(r.originalSalePrice) || 0).toLocaleString('en-IN')}`);
-    L.push(`📅 Sale Date: ${r.originalSaleDate}`);
-    L.push('');
-    L.push(`📅 Return Date: ${r.returnDate}`);
-    L.push('');
-    if (r.returnType === 'money') {
-        L.push(`💵 Return Amount: ₹${(Number(r.returnAmount) || 0).toLocaleString('en-IN')}`);
-    } else {
-        L.push(`📱 Exchange Phone: ${r.exchangeModel || '—'}`);
-        L.push(`📦 From: ${r.exchangePhoneSource === 'cashify' ? 'Cashify' : 'Flipkart'} Inventory`);
-    }
-    L.push('');
-    L.push('📊 *Updated Inventory:*');
-    L.push(`   • Flipkart: ${r.inventoryCountFlipkart} units`);
-    L.push(`   • Cashify: ${r.inventoryCountCashify} units`);
-    return L.join('\n');
-}
-
-// ==========================================
-// RETURN SUCCESS MODAL
-// ==========================================
-async function showReturnSuccessModal(message) {
-    const result = await Swal.fire({
-        title: '✅ Return Processed Successfully',
-        html: `
-            <div style="text-align:left;">
-                <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
-                <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
-            </div>`,
-        showDenyButton: true,
-        showCancelButton: true,
-        confirmButtonText: '📋 Copy Message',
-        denyButtonText: '📱 Open WhatsApp',
-        cancelButtonText: 'Close',
-        confirmButtonColor: '#059669',
-        denyButtonColor: '#25D366',
-        cancelButtonColor: '#64748b',
-        width: 'min(560px, 96vw)'
-    });
-
-    if (result.isConfirmed) {
-        await copyTextToClipboard(message);
-    } else if (result.isDenied) {
-        openWhatsApp(message);
-    }
-}
-
-async function copyTextToClipboard(text) {
-    try {
-        await navigator.clipboard.writeText(text);
-        showToast('✅ Message copied to clipboard', 'success');
-    } catch (e) {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        try { document.execCommand('copy'); showToast('✅ Message copied', 'success'); }
-        catch (err) { showToast('Copy failed — please select manually', 'error'); }
-        document.body.removeChild(ta);
-    }
-}
-
-function openWhatsApp(message) {
-    const url = 'https://wa.me/?text=' + encodeURIComponent(message);
-    window.open(url, '_blank');
-}
-
-// ==========================================
-// RETURN HISTORY
-// ==========================================
-async function loadReturnsHistory() {
-    const container = document.getElementById('returnsHistoryList');
-    if (!container) return;
-    container.innerHTML = `<div class="text-center py-6 text-gray-400 text-sm"><span class="spinner-sm"></span> Loading...</div>`;
-
-    try {
-        const db = getDb(currentSource);
-        const snap = await db.ref('returns').once('value');
-        const data = snap.val() || {};
-
-        const returns = Object.entries(data)
-            .map(([id, item]) => ({ id, ...item }))
-            .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-            .slice(0, 20);
-
-        if (!returns.length) {
-            container.innerHTML = `<div class="text-center py-8 text-gray-400 text-sm">No returns recorded yet for ${getSourceLabel(currentSource)}</div>`;
-            return;
-        }
-
-        let html = '<div class="space-y-2">';
-        returns.forEach(r => {
-            const returnInfo = r.returnType === 'money'
-                ? `💵 ₹${(Number(r.returnAmount) || 0).toLocaleString('en-IN')} returned`
-                : `📱 ${escapeHtml(r.exchangeModel || '—')} (${r.exchangePhoneSource === 'cashify' ? 'Cashify' : 'Flipkart'})`;
-
-            html += `
-                <div class="return-history-item">
-                    <div class="flex items-start justify-between gap-2 mb-1">
-                        <div class="min-w-0 flex-1">
-                            <div class="font-mono font-bold text-gray-800 text-sm truncate">${escapeHtml(r.originalOrderId || '—')}</div>
-                            <div class="text-sm text-gray-700 truncate mt-0.5">${escapeHtml(r.originalModel || '—')}</div>
-                        </div>
-                        <span class="text-xs text-gray-500 whitespace-nowrap">${escapeHtml(r.returnDate || '—')}</span>
+                <div class="mb-3">
+                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Bill Number</label>
+                    <input type="text" id="billNumber" placeholder="Bill / Invoice no." class="input-field w-full p-3 rounded-xl outline-none">
+                </div>
+                <div class="mb-4">
+                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Bill Images <span class="text-gray-400 font-normal">(up to 3)</span></label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label for="billImageCam" class="btn-bounce cursor-pointer flex items-center justify-center gap-2 p-3 rounded-xl border-2 border-dashed border-blue-300 bg-blue-50 text-blue-700 font-semibold text-sm">
+                            <i data-lucide="camera" class="w-4 h-4"></i> Camera
+                        </label>
+                        <label for="billImageGal" class="btn-bounce cursor-pointer flex items-center justify-center gap-2 p-3 rounded-xl border-2 border-dashed border-blue-300 bg-blue-50 text-blue-700 font-semibold text-sm">
+                            <i data-lucide="image" class="w-4 h-4"></i> Gallery
+                        </label>
                     </div>
-                    <div class="text-xs text-gray-600 mt-1">${returnInfo}</div>
-                    <div class="flex items-center justify-between mt-2 pt-2 border-t border-gray-100">
-                        <span class="text-[10px] text-gray-400">Original Sale: ₹${(Number(r.originalSalePrice) || 0).toLocaleString('en-IN')}</span>
-                        <button onclick="viewReturnMessage('${r.id}')" class="text-[10px] text-indigo-600 font-semibold hover:underline">View / Resend Message</button>
+                    <input id="billImageCam" type="file" accept="image/*" capture="environment" class="hidden" onchange="handlePickupImagePick(this,'bill')">
+                    <input id="billImageGal" type="file" accept="image/*" multiple class="hidden" onchange="handlePickupImagePick(this,'bill')">
+                    <div id="billImgPreview" class="mt-2"></div>
+                    <div id="billImgInfo" class="text-[11px] text-gray-500 mt-1">3 images max · 3 slots free</div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Aadhaar Number</label>
+                    <input type="text" id="aadhaarNumber" placeholder="12-digit Aadhaar" inputmode="numeric" maxlength="14" class="input-field w-full p-3 rounded-xl outline-none font-mono">
+                </div>
+                <div>
+                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Aadhaar Images <span class="text-gray-400 font-normal">(up to 3)</span></label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label for="aadhaarImageCam" class="btn-bounce cursor-pointer flex items-center justify-center gap-2 p-3 rounded-xl border-2 border-dashed border-indigo-300 bg-indigo-50 text-indigo-700 font-semibold text-sm">
+                            <i data-lucide="camera" class="w-4 h-4"></i> Camera
+                        </label>
+                        <label for="aadhaarImageGal" class="btn-bounce cursor-pointer flex items-center justify-center gap-2 p-3 rounded-xl border-2 border-dashed border-indigo-300 bg-indigo-50 text-indigo-700 font-semibold text-sm">
+                            <i data-lucide="image" class="w-4 h-4"></i> Gallery
+                        </label>
                     </div>
-                </div>`;
+                    <input id="aadhaarImageCam" type="file" accept="image/*" capture="environment" class="hidden" onchange="handlePickupImagePick(this,'aadhaar')">
+                    <input id="aadhaarImageGal" type="file" accept="image/*" multiple class="hidden" onchange="handlePickupImagePick(this,'aadhaar')">
+                    <div id="aadhaarImgPreview" class="mt-2"></div>
+                    <div id="aadhaarImgInfo" class="text-[11px] text-gray-500 mt-1">3 images max · 3 slots free</div>
+                </div>
+            </div>
+        `;
+    } else {
+        const reasons = (status === 'rejected') ? rejectReasons : rescheduleReasons;
+        const isReject = status === 'rejected';
+        formTitle.innerText = isReject ? "Rejection Reason" : "Reschedule / Pending";
+        formSubtitle.innerText = isReject ? "Select the most appropriate reason" : "Select reason — 'On the way' means you're heading there";
+        formIcon.className = `w-12 h-12 rounded-xl flex items-center justify-center bg-gradient-to-br ${isReject ? 'from-red-500 to-rose-600' : 'from-amber-500 to-orange-600'}`;
+        formIcon.innerHTML = `<i data-lucide="${isReject ? 'x-circle' : 'clock'}" class="w-7 h-7 text-white"></i>`;
+        submitBtn.className = `btn-bounce w-full bg-gradient-to-r ${isReject ? 'from-red-500 to-rose-600' : 'from-amber-500 to-orange-600'} text-white p-4 rounded-2xl font-bold text-lg shadow-xl flex items-center justify-center gap-2`;
+        let reasonsHtml = `
+            <div>
+                <label class="text-xs font-bold text-gray-500 mb-1.5 block">PHONE MODEL *</label>
+                <input type="text" id="phoneModelRejectReschedule" placeholder="e.g., iPhone 12, Samsung S21" class="input-field w-full p-3.5 rounded-xl outline-none">
+            </div>
+            <div class="space-y-2">
+        `;
+        reasons.forEach(r => {
+            reasonsHtml += `
+                <button type="button" onclick="selectReason(this, '${r.text}')" data-reason="${r.text}" class="reason-btn w-full text-left p-3.5 rounded-xl flex items-center gap-3 hover:bg-gray-50">
+                    <div class="icon-wrap w-8 h-8 bg-gray-100 rounded-lg flex items-center justify-center flex-shrink-0">
+                        <i data-lucide="${r.icon}" class="w-4 h-4 text-gray-600"></i>
+                    </div>
+                    <span class="font-medium text-sm">${r.text}</span>
+                </button>
+            `;
         });
-        html += '</div>';
-        container.innerHTML = html;
-        refreshIcons();
-    } catch (e) {
-        console.error('Load returns history error:', e);
-        container.innerHTML = `<div class="text-center py-6 text-red-400 text-sm">Failed to load returns</div>`;
+        reasonsHtml += '</div>';
+        reasonsHtml += '<input type="text" id="otherReason" placeholder="Type your reason here..." class="input-field w-full p-3.5 rounded-xl outline-none hidden mt-3">';
+        formFields.innerHTML = reasonsHtml;
+        setTimeout(() => {
+            const firstBtn = document.querySelector('.reason-btn');
+            if (firstBtn) selectReason(firstBtn, firstBtn.dataset.reason);
+        }, 100);
     }
+    lucide.createIcons();
+    if (status === 'pickup') updateSpecUI();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-async function viewReturnMessage(returnId) {
+// === SECTION 16: SUBMIT DATA (REGULAR PICKUP — UNCHANGED) ===
+async function submitData() {
+    if (!currentUser) { showToast('Please login first', 'error'); return; }
+    if (currentUser.role !== 'admin') {
+        const userSnap = await db.ref('users/' + currentUser.username + '/is_blocked').once('value');
+        if (userSnap.val() === true) { showToast('🔒 You are blocked for today!', 'error'); return; }
+    }
+    const orderId = document.getElementById('orderId').value.trim().toUpperCase();
+    let existingData = null, exists = false;
     try {
-        const db = getDb(currentSource);
-        const snap = await db.ref('returns/' + returnId).once('value');
-        const record = snap.val();
-        if (!record) { showToast('Return record not found', 'error'); return; }
-        const message = buildReturnMessage(record);
-        await showReturnSuccessModal(message);
+        const existingSnap = await db.ref('pickups/' + orderId).once('value');
+        exists = existingSnap.exists();
+        if (exists) existingData = existingSnap.val();
     } catch (e) {
         console.error(e);
-        showToast('Failed to load return message', 'error');
+        showToast('Error checking order', 'error');
+        return;
+    }
+    if (exists && existingData.status === 'rejected' && currentStatus === 'pickup') {
+        const { value: password, isConfirmed } = await Swal.fire({
+            title: '🔐 Admin Password Required',
+            html: `
+                <p class="text-sm text-gray-600 mb-2">This order was previously <span class="text-red-600 font-bold">REJECTED</span>.</p>
+                <p class="text-sm text-gray-600 mb-2">Enter admin password to mark as <span class="text-green-600 font-bold">PICKUP COMPLETED</span>.</p>
+                <p class="text-xs text-gray-400 mt-2">Only admin knows this password.</p>
+            `,
+            input: 'password', inputPlaceholder: 'Enter admin password',
+            inputAttributes: { autocapitalize: 'off', autocorrect: 'off' },
+            showCancelButton: true, confirmButtonColor: '#3b82f6', cancelButtonColor: '#dc2626',
+            confirmButtonText: '✅ Verify & Proceed', cancelButtonText: 'Cancel',
+            allowOutsideClick: false,
+            preConfirm: (input) => { if (!input) { Swal.showValidationMessage('Enter password'); return false; } return input; }
+        });
+        if (!isConfirmed) { showToast('Cancelled', 'error'); return; }
+        if (password !== 'admin123') {
+            Swal.fire({ icon: 'error', title: 'Wrong Password', text: 'Invalid admin password.', confirmButtonColor: '#dc2626' });
+            return;
+        }
+        showToast('✅ Password verified!', 'success');
+    }
+    if (exists && existingData.status === 'pickup' && currentStatus === 'pickup') {
+        Swal.fire({ icon: 'error', title: 'Already Pickup Completed', text: `Order ${orderId} already marked.`, confirmButtonColor: '#3b82f6' });
+        return;
+    }
+    const now = new Date();
+    const istDateTime = getISTDateTime();
+    let dbData = {
+        orderId, status: currentStatus,
+        timestamp: now.toISOString(), timestampIST: istDateTime,
+        date: now.toLocaleDateString('en-IN'), time: now.toLocaleTimeString('en-IN'),
+        agent: currentUser.username
+    };
+    let whatsappMsg = '';
+    if (currentStatus === 'pickup') {
+        const phoneModel = document.getElementById('phoneModel').value.trim();
+        const imei = document.getElementById('imei').value.trim();
+        const value = document.getElementById('value').value.trim();
+        const custName = document.getElementById('custName').value.trim();
+        if (!phoneModel || !imei || !value) {
+            Swal.fire({ icon: 'error', title: 'Missing Details', text: 'Fill Model, IMEI, Value', confirmButtonColor: '#3b82f6' });
+            return;
+        }
+        dbData.phoneModel = phoneModel;
+        dbData.imei = imei;
+        if (hiddenImei2) dbData.imei2 = hiddenImei2;
+        dbData.value = parseInt(value);
+        dbData.customerName = custName || 'N/A';
+        if (!selectedRam || !selectedStorage || !selectedNetwork) {
+            const miss = [];
+            if (!selectedRam) miss.push('RAM');
+            if (!selectedStorage) miss.push('Storage');
+            if (!selectedNetwork) miss.push('Network');
+            Swal.fire({
+                icon: 'warning', title: 'Device Specs Required',
+                html: `<p class="text-sm text-gray-600">Please select <b>${miss.join(', ')}</b> before submitting.</p>`,
+                confirmButtonColor: '#3b82f6'
+            });
+            const box = document.getElementById('specSummary');
+            if (box) box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+        }
+        dbData.ram = selectedRam;
+        dbData.storage = selectedStorage;
+        dbData.ramStorage = selectedRam + '/' + selectedStorage;
+        dbData.networkType = selectedNetwork;
+        const _billNo = (document.getElementById('billNumber')?.value || '').trim();
+        const _aadNo = (document.getElementById('aadhaarNumber')?.value || '').trim();
+        if (_billNo) dbData.billNumber = _billNo;
+        if (_aadNo) dbData.aadhaarNumber = _aadNo;
+        if (pickupBillImages.length) {
+            Swal.fire({ title: 'Uploading Bill Images...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+            const billUrls = [];
+            for (let i = 0; i < pickupBillImages.length; i++) {
+                try {
+                    const blob = await (await fetch(pickupBillImages[i])).blob();
+                    const fileName = `${orderId}_bill_${i}_${Date.now()}.jpg`;
+                    const storageRef = storage.ref(`pickup_docs/${orderId}/bill/${fileName}`);
+                    const snapshot = await storageRef.put(blob, { contentType: 'image/jpeg' });
+                    billUrls.push(await snapshot.ref.getDownloadURL());
+                } catch (e) {
+                    console.error('Bill image upload failed:', e);
+                    Swal.close();
+                    showToast('❌ Bill image upload failed', 'error');
+                    return;
+                }
+            }
+            dbData.billImages = billUrls;
+            dbData.billImage = billUrls[0];
+            Swal.close();
+        }
+        if (pickupAadhaarImages.length) {
+            Swal.fire({ title: 'Uploading Aadhaar Images...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+            const aadhaarUrls = [];
+            for (let i = 0; i < pickupAadhaarImages.length; i++) {
+                try {
+                    const blob = await (await fetch(pickupAadhaarImages[i])).blob();
+                    const fileName = `${orderId}_aadhaar_${i}_${Date.now()}.jpg`;
+                    const storageRef = storage.ref(`pickup_docs/${orderId}/aadhaar/${fileName}`);
+                    const snapshot = await storageRef.put(blob, { contentType: 'image/jpeg' });
+                    aadhaarUrls.push(await snapshot.ref.getDownloadURL());
+                } catch (e) {
+                    console.error('Aadhaar image upload failed:', e);
+                    Swal.close();
+                    showToast('❌ Aadhaar image upload failed', 'error');
+                    return;
+                }
+            }
+            dbData.aadhaarImages = aadhaarUrls;
+            dbData.aadhaarImage = aadhaarUrls[0];
+            Swal.close();
+        }
+        whatsappMsg = `Order ID: ${orderId}\nStatus: Pickup Completed`;
+    } else {
+        const phoneModel = document.getElementById('phoneModelRejectReschedule').value.trim();
+        if (!phoneModel) {
+            Swal.fire({ icon: 'error', title: 'Missing Model', text: 'Enter phone model', confirmButtonColor: '#3b82f6' });
+            return;
+        }
+        dbData.phoneModel = phoneModel;
+        let reason = selectedReason;
+        if (reason.toLowerCase().includes('other')) {
+            reason = document.getElementById('otherReason').value.trim();
+            if (!reason) {
+                Swal.fire({ icon: 'warning', title: 'Reason Required', text: 'Type the reason', confirmButtonColor: '#3b82f6' });
+                return;
+            }
+        }
+        if (!reason) {
+            Swal.fire({ icon: 'warning', title: 'Select Reason', text: 'Choose a reason', confirmButtonColor: '#3b82f6' });
+            return;
+        }
+        dbData.reason = reason;
+        if (currentStatus === 'rejected') {
+            whatsappMsg = `Order ID: ${orderId}\nModel: ${dbData.phoneModel}\nReason: ${dbData.reason}\nStatus: Rejected`;
+            dbData.incentive_approved = false;
+            dbData.incentive_paid = false;
+        } else {
+            whatsappMsg = `Order ID: ${orderId}\nModel: ${dbData.phoneModel}\nReason: ${dbData.reason}\nStatus: Rescheduled`;
+        }
+    }
+    if (currentStatus === 'reschedule') {
+        try {
+            const pendingSnap = await db.ref('pending/' + orderId).once('value');
+            if (pendingSnap.exists()) {
+                const existingReason = pendingSnap.val().reason || '';
+                if (existingReason !== dbData.reason) {
+                    const r = await Swal.fire({
+                        title: 'Change Reason?',
+                        text: `Existing: "${existingReason}". Update to "${dbData.reason}"?`,
+                        icon: 'question', showCancelButton: true,
+                        confirmButtonColor: '#f59e0b', confirmButtonText: 'Update', cancelButtonText: 'Cancel'
+                    });
+                    if (!r.isConfirmed) { showToast('Cancelled', 'error'); return; }
+                }
+            }
+        } catch (e) { console.error(e); }
+    }
+    Swal.fire({ title: 'Saving...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+    try {
+        if (exists) await db.ref('pickups/' + orderId).update(dbData);
+        else await db.ref('pickups/' + orderId).set(dbData);
+        if (currentStatus === 'pickup' || currentStatus === 'rejected') {
+            const pendingSnap = await db.ref('pending/' + orderId).once('value');
+            if (pendingSnap.exists()) {
+                await db.ref('pending/' + orderId).remove();
+                await loadPendingOrders();
+            }
+        }
+        if (currentStatus === 'reschedule') {
+            const pendingData = {
+                orderId, phoneModel: dbData.phoneModel,
+                reason: dbData.reason || selectedReason, status: 'reschedule',
+                timestamp: now.toISOString(), timestampIST: istDateTime,
+                agent: currentUser.username
+            };
+            await db.ref('pending/' + orderId).set(pendingData);
+            await loadPendingOrders();
+        }
+        const result = await Swal.fire({
+            icon: 'success', title: '✅ Saved!',
+            html: `
+                <p class="text-sm text-gray-600 mb-2">📊 Firebase me time save ho gaya:</p>
+                <div class="text-left bg-blue-50 p-2 rounded-lg text-xs font-mono mb-3">${istDateTime}</div>
+                <p class="text-sm text-gray-600 mb-2">📱 WhatsApp message (no time):</p>
+                <div class="text-left bg-gray-50 p-3 rounded-lg text-xs font-mono whitespace-pre-wrap">${whatsappMsg}</div>
+            `,
+            showCancelButton: true, showDenyButton: true,
+            confirmButtonText: '📤 Open WhatsApp', denyButtonText: '📋 Copy Message', cancelButtonText: 'Close',
+            confirmButtonColor: '#25D366', denyButtonColor: '#3b82f6'
+        });
+        if (result.isConfirmed) window.open(`https://wa.me/?text=${encodeURIComponent(whatsappMsg)}`, '_blank');
+        else if (result.isDenied) {
+            try { await navigator.clipboard.writeText(whatsappMsg); showToast('✅ Copied!', 'success'); }
+            catch (e) {
+                const ta = document.createElement('textarea');
+                ta.value = whatsappMsg;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showToast('✅ Copied!', 'success');
+            }
+        }
+        document.getElementById('orderId').value = '';
+        hiddenImei2 = '';
+        goBack();
+        loadTodayStats();
+        loadPendingOrders();
+    } catch (error) {
+        Swal.fire({ icon: 'error', title: 'Error', text: error.message });
     }
 }
 
-// ==========================================
-// INIT
-// ==========================================
-document.addEventListener('DOMContentLoaded', () => {
-    setupOfflineDetection();
-    refreshIcons();
+// === SECTION 17: SCANNER FUNCTIONS (Barcode + OCR) ===
+// 🔥 Modified: routes IMEI to correct input based on scannerTarget
 
-    document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.source === currentSource);
+function setScanMode(mode) {
+    scanMode = mode;
+    document.querySelectorAll('#scanModeToggle button').forEach(b => {
+        b.classList.toggle('active', b.dataset.mode === mode);
     });
+    const hint = document.getElementById('scanHint');
+    const tip = document.getElementById('scanTip');
+    const captureBtn = document.getElementById('captureBtn');
+    if (mode === 'barcode') {
+        hint.textContent = '📱 Barcode ko box me align karo';
+        tip.innerHTML = '<strong>💡 Tip:</strong> Phone box ya back panel pe IMEI barcode hota hai.';
+        captureBtn.style.display = 'none';
+        document.getElementById('imeiResult').classList.remove('show');
+    } else {
+        hint.textContent = '📱 *#06# screen dikhao — phir Capture dabao';
+        tip.innerHTML = '<strong>💡 Tip:</strong> Phone me *#06# dial karo, IMEI screen dikhao.';
+        captureBtn.style.display = 'flex';
+        document.getElementById('imeiResult').classList.remove('show');
+        captureBtn.disabled = false;
+        captureBtn.innerHTML = '<i data-lucide="camera"></i> Capture & Read IMEI';
+        lucide.createIcons();
+    }
+    lucide.createIcons();
+}
 
-    updateSourceTabsForView();
-    loadInventory();
+async function initTesseract() {
+    if (typeof Tesseract === 'undefined') { console.warn('Tesseract not loaded'); return null; }
+    try {
+        const worker = await Tesseract.createWorker('eng', 1, {
+            logger: m => {
+                if (m.status === 'recognizing text') {
+                    const pct = Math.round(m.progress * 100);
+                    document.getElementById('ocrProgressBar').style.width = pct + '%';
+                }
+            }
+        });
+        await worker.setParameters({
+            tessedit_char_whitelist: '0123456789IMEI: ',
+            tessedit_pageseg_mode: '6',
+            tessedit_ocr_engine_mode: '3'
+        });
+        return worker;
+    } catch (e) { console.error(e); return null; }
+}
 
-    setInterval(() => {
-        if (document.hidden) return;
-        if (currentView === 'inventory') loadInventory();
-        else { loadReturnsView(); loadReturnsHistory(); }
-    }, 60000);
+async function startScanner() {
+    const modal = document.getElementById('scannerModal');
+    const video = document.getElementById('scanVideo');
+    const statusText = document.getElementById('scanStatusText');
+    const spinner = document.getElementById('scanSpinner');
+    modal.classList.remove('hidden');
+    statusText.textContent = '🔄 Starting camera...';
+    spinner.style.display = 'inline-block';
+    lucide.createIcons();
+    document.getElementById('imeiResult').classList.remove('show');
+    document.getElementById('ocrProgress').style.display = 'none';
+    document.getElementById('ocrProgressBar').style.width = '0%';
+    if (scanMode === 'ocr') { tesseractWorker = await initTesseract(); }
+    try {
+        if (typeof ZXing === 'undefined' || !ZXing.BrowserMultiFormatReader) throw new Error('ZXing not loaded');
+        const hints = new Map();
+        const formats = [
+            ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.CODE_39,
+            ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8,
+            ZXing.BarcodeFormat.UPC_A, ZXing.BarcodeFormat.UPC_E,
+            ZXing.BarcodeFormat.ITF, ZXing.BarcodeFormat.QR_CODE,
+            ZXing.BarcodeFormat.DATA_MATRIX, ZXing.BarcodeFormat.CODE_93
+        ];
+        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+        hints.set(ZXing.DecodeHintType.CHARACTER_SET, 'UTF-8');
+        zxingCodeReader = new ZXing.BrowserMultiFormatReader(hints);
+        const devices = await zxingCodeReader.listVideoInputDevices();
+        let deviceId = null;
+        for (const d of devices) {
+            if (d.label && /back|rear|environment/i.test(d.label)) { deviceId = d.deviceId; break; }
+        }
+        if (!deviceId && devices.length > 0) deviceId = devices[devices.length - 1].deviceId;
+        statusText.textContent = '📷 Camera ready';
+        await zxingCodeReader.decodeFromVideoDevice(
+            deviceId,
+            'scanVideo',
+            (result, err) => {
+                if (result && scanMode === 'barcode') {
+                    const raw = result.getText();
+                    const imeis = extractIMEIs(raw);
+                    if (imeis.imei1 && imeis.imei1.length >= 14) onScanSuccess(imeis.imei1, imeis.imei2);
+                } else if (err && !(err instanceof ZXing.NotFoundException)) {
+                    console.error(err);
+                }
+            }
+        );
+        isScanning = true;
+        statusText.textContent = scanMode === 'barcode' ? '🎯 Scanning...' : '📱 Ready';
+        spinner.style.display = 'none';
+        if (scanMode === 'ocr') {
+            document.getElementById('captureBtn').style.display = 'flex';
+            document.getElementById('captureBtn').disabled = false;
+            document.getElementById('captureBtn').innerHTML = '<i data-lucide="camera"></i> Capture & Read IMEI';
+            lucide.createIcons();
+        } else {
+            document.getElementById('captureBtn').style.display = 'none';
+        }
+    } catch (err) {
+        console.error(err);
+        stopScanner();
+        let msg = 'Camera access failed';
+        if (err.name === 'NotAllowedError') msg = 'Allow camera permission';
+        else if (err.name === 'NotFoundError') msg = 'No camera found';
+        else if (err.name === 'NotSecureError' || window.location.protocol === 'file:') msg = 'Camera needs HTTPS.';
+        Swal.fire({ icon: 'error', title: 'Camera Error', text: msg });
+    }
+}
 
-    showToast('👋 Sales Manager ready', 'info', 2000);
-    console.log('✅ Sales Manager (dual-source + returns) initialized');
+async function startOCRScanning() {
+    if (scanMode !== 'ocr' || isOcrScanning) return;
+    if (!tesseractWorker) {
+        showToast('⏳ Initializing OCR...', 'info');
+        tesseractWorker = await initTesseract();
+        if (!tesseractWorker) { showToast('❌ OCR failed', 'error'); return; }
+    }
+    const video = document.getElementById('scanVideo');
+    if (!video.videoWidth) { showToast('⏳ Camera not ready', 'error'); return; }
+    isOcrScanning = true;
+    lastDetectedImei = '';
+    ocrAttemptCount = 0;
+    const captureBtn = document.getElementById('captureBtn');
+    captureBtn.disabled = true;
+    captureBtn.innerHTML = '<span class="spinner" style="width:20px;height:20px;border-width:2px;"></span> Scanning...';
+    const statusText = document.getElementById('scanStatusText');
+    const progress = document.getElementById('ocrProgress');
+    const progressBar = document.getElementById('ocrProgressBar');
+    progress.style.display = 'block';
+    progressBar.style.width = '0%';
+    statusText.textContent = '📸 Capturing...';
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const maxW = 800;
+    const scale = Math.min(1, maxW / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+        const gray = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+        const adjusted = ((gray / 255 - 0.5) * 2.2 + 0.5) * 255;
+        const val = Math.max(0, Math.min(255, adjusted));
+        d[i] = d[i + 1] = d[i + 2] = val;
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    try {
+        const { data: { text } } = await tesseractWorker.recognize(canvas);
+        const imeis = extractIMEIs(text);
+        if (imeis.imei1 && imeis.imei1.length >= 14) { handleImeiFound(imeis.imei1, imeis.imei2); return; }
+    } catch (e) { console.error(e); }
+
+    statusText.textContent = '🔍 Scanning in background...';
+    progressBar.style.width = '0%';
+    ocrAttemptCount = 0;
+    if (ocrInterval) clearInterval(ocrInterval);
+    ocrInterval = setInterval(async () => {
+        if (!isScanning || !isOcrScanning) { stopOCRScanning(); return; }
+        if (!video.videoWidth) return;
+        ocrAttemptCount++;
+        const c2 = document.createElement('canvas');
+        const ctx2 = c2.getContext('2d');
+        const maxW2 = 640;
+        const scale2 = Math.min(1, maxW2 / video.videoWidth);
+        c2.width = Math.round(video.videoWidth * scale2);
+        c2.height = Math.round(video.videoHeight * scale2);
+        ctx2.imageSmoothingEnabled = true;
+        ctx2.imageSmoothingQuality = 'high';
+        ctx2.drawImage(video, 0, 0, c2.width, c2.height);
+        const imgData2 = ctx2.getImageData(0, 0, c2.width, c2.height);
+        const d2 = imgData2.data;
+        for (let i = 0; i < d2.length; i += 4) {
+            const gray = d2[i] * 0.299 + d2[i + 1] * 0.587 + d2[i + 2] * 0.114;
+            const adjusted = ((gray / 255 - 0.5) * 2.2 + 0.5) * 255;
+            const val = Math.max(0, Math.min(255, adjusted));
+            d2[i] = d2[i + 1] = d2[i + 2] = val;
+        }
+        ctx2.putImageData(imgData2, 0, 0);
+        progressBar.style.width = Math.min(100, (ocrAttemptCount / 15) * 100) + '%';
+        try {
+            const { data: { text } } = await tesseractWorker.recognize(c2);
+            const imeis = extractIMEIs(text);
+            if (imeis.imei1 && imeis.imei1.length >= 14) { handleImeiFound(imeis.imei1, imeis.imei2); return; }
+        } catch (e) { console.error(e); }
+    }, 1500);
+}
+
+// 🔥 Modified: target input based on scannerTarget
+function handleImeiFound(imei1, imei2) {
+    if (!isOcrScanning && !isScanning) return;
+    if (imei1 === lastDetectedImei) return;
+    lastDetectedImei = imei1;
+    document.getElementById('imeiResultText').textContent = '✅ IMEI: ' + imei1 + (imei2 ? ' | IMEI2 captured' : '');
+    document.getElementById('imeiResult').classList.add('show');
+    const targetInput = scannerTarget === 'outside'
+        ? document.getElementById('opImei')
+        : document.getElementById('imei');
+    if (targetInput) {
+        targetInput.value = imei1;
+        targetInput.classList.add('flash-green');
+        setTimeout(() => targetInput.classList.remove('flash-green'), 500);
+    }
+    if (imei2) hiddenImei2 = imei2;
+    if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
+    document.getElementById('scanStatusText').textContent = '✅ IMEI captured!';
+    showToast('✅ IMEI: ' + imei1, 'success');
+    stopOCRScanning();
+    setTimeout(() => stopScanner(), 800);
+}
+
+function stopOCRScanning() {
+    isOcrScanning = false;
+    if (ocrInterval) { clearInterval(ocrInterval); ocrInterval = null; }
+    const captureBtn = document.getElementById('captureBtn');
+    if (captureBtn) {
+        captureBtn.disabled = false;
+        captureBtn.innerHTML = '<i data-lucide="camera"></i> Capture & Read IMEI';
+    }
+    lucide.createIcons();
+    document.getElementById('ocrProgress').style.display = 'none';
+    document.getElementById('ocrProgressBar').style.width = '0%';
+}
+
+function isValidIMEI(imei) {
+    if (!imei || imei.length !== 15) return false;
+    if (!/^\d{15}$/.test(imei)) return false;
+    if (!/^[3-9]/.test(imei)) return false;
+    let sum = 0;
+    for (let i = 0; i < 15; i++) {
+        let digit = parseInt(imei[i]);
+        if (i % 2 === 1) { digit *= 2; if (digit > 9) digit -= 9; }
+        sum += digit;
+    }
+    return sum % 10 === 0;
+}
+
+function extractIMEIs(text) {
+    let imei1 = null, imei2 = null, candidates = [];
+    let clean = text.replace(/[Oo]/g,'0').replace(/[Ss]/g,'5').replace(/[Bb]/g,'8').replace(/[Zz]/g,'2').replace(/[Gg]/g,'6').replace(/[Tt]/g,'7').replace(/[Ll]/g,'1').replace(/\s+/g,' ').trim();
+    const all15Digits = clean.match(/\d{15}/g) || [];
+    const all14Digits = clean.match(/\d{14}/g) || [];
+    for (let num of all15Digits) {
+        if (/^[3-9]/.test(num) && isValidIMEI(num)) candidates.push(num);
+    }
+    const imeiPatterns = [
+        /IMEI\s*1\s*[:\-]?\s*(\d{15})/i,
+        /IMEI\s*[:\-]?\s*(\d{15})/i,
+        /IMEI1\s*[:\-]?\s*(\d{15})/i,
+        /IMEI2\s*[:\-]?\s*(\d{15})/i
+    ];
+    for (let pattern of imeiPatterns) {
+        const match = clean.match(pattern);
+        if (match && match[1]) {
+            const num = match[1];
+            if (/^[3-9]/.test(num) && isValidIMEI(num)) {
+                if (!imei1) imei1 = num;
+                else if (num !== imei1 && !imei2) imei2 = num;
+            }
+        }
+    }
+    if (!imei1 && candidates.length > 0) imei1 = candidates[0];
+    if (!imei2 && candidates.length > 1) {
+        for (let c of candidates) {
+            if (c !== imei1) { imei2 = c; break; }
+        }
+    }
+    if (!imei1 && all14Digits.length > 0) {
+        for (let num of all14Digits) {
+            if (!/^[3-9]/.test(num)) continue;
+            for (let check = 0; check <= 9; check++) {
+                const candidate = num + check;
+                if (isValidIMEI(candidate)) {
+                    if (!imei1) imei1 = candidate;
+                    else if (candidate !== imei1 && !imei2) imei2 = candidate;
+                    break;
+                }
+            }
+            if (imei1 && imei2) break;
+        }
+    }
+    if (imei1 && !isValidIMEI(imei1)) imei1 = null;
+    if (imei2 && !isValidIMEI(imei2)) imei2 = null;
+    return { imei1, imei2 };
+}
+
+// 🔥 Modified: target input based on scannerTarget
+function onScanSuccess(imei1, imei2) {
+    if (!isScanning) return;
+    isScanning = false;
+    const targetInput = scannerTarget === 'outside'
+        ? document.getElementById('opImei')
+        : document.getElementById('imei');
+    if (targetInput) {
+        targetInput.value = imei1;
+        targetInput.classList.add('flash-green');
+        setTimeout(() => targetInput.classList.remove('flash-green'), 500);
+    }
+    if (imei2) hiddenImei2 = imei2;
+    if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
+    stopScanner();
+    showToast('✅ IMEI: ' + imei1, 'success');
+}
+
+function stopScanner() {
+    isScanning = false;
+    scannerTarget = 'regular'; // 🔥 reset target after scan completes/cancels
+    stopOCRScanning();
+    if (zxingCodeReader) { try { zxingCodeReader.reset(); } catch (e) {} zxingCodeReader = null; }
+    const video = document.getElementById('scanVideo');
+    if (video && video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+    }
+    if (tesseractWorker) { try { tesseractWorker.terminate(); } catch (e) {} tesseractWorker = null; }
+    document.getElementById('scannerModal').classList.add('hidden');
+    document.getElementById('scanSpinner').style.display = 'none';
+    document.getElementById('scanStatusText').textContent = 'Stopped';
+    document.getElementById('ocrProgress').style.display = 'none';
+    document.getElementById('captureBtn').style.display = 'none';
+    document.getElementById('imeiResult').classList.remove('show');
+    const captureBtn = document.getElementById('captureBtn');
+    if (captureBtn) {
+        captureBtn.disabled = false;
+        captureBtn.innerHTML = '<i data-lucide="camera"></i> Capture & Read IMEI';
+    }
+    lucide.createIcons();
+}
+
+// === SECTION 18: TOAST ===
+function showToast(message, type = 'info') {
+    const colors = { success: 'bg-green-500', error: 'bg-red-500', info: 'bg-blue-500' };
+    const toast = document.createElement('div');
+    toast.className = `fixed top-20 left-1/2 -translate-x-1/2 ${colors[type]} text-white px-5 py-3 rounded-xl shadow-2xl z-[60] font-semibold text-sm fade-in max-w-[90%]`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => {
+        toast.style.transition = 'opacity 0.3s';
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+    }, 2800);
+}
+
+// === SECTION 19: IST DATE/TIME FORMATTER ===
+function getISTDateTime() {
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istTime = new Date(now.getTime() + istOffset);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const dd = String(istTime.getUTCDate()).padStart(2,'0');
+    const mmm = months[istTime.getUTCMonth()];
+    const yyyy = istTime.getUTCFullYear();
+    let hours = istTime.getUTCHours();
+    const minutes = String(istTime.getUTCMinutes()).padStart(2,'0');
+    const seconds = String(istTime.getUTCSeconds()).padStart(2,'0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12 || 12;
+    const hh = String(hours).padStart(2,'0');
+    return `${dd}-${mmm}-${yyyy}, ${hh}:${minutes}:${seconds} ${ampm} IST`;
+}
+
+// ================================================================
+// === SECTION 20: OUTSIDE PICKUP — NEW FEATURE ===================
+// ================================================================
+// ID format: OP-YYMMDD-NNNN
+//   - OP      = Outside Pickup prefix
+//   - YYMMDD  = date (readable, sortable)
+//   - NNNN    = daily counter via Firebase transaction (0001-9999,
+//               extends to 10000+ naturally if needed)
+//   Backend uniqueness enforced by `outside_pickup_counters/{YYMMDD}`
+//   transaction — safe across concurrent riders, no collisions.
+// Record path: outside_pickups/{pickupId}
+// Inventory impact: NONE until admin approval (which writes to
+// `pickups/{pickupId}` and thus appears in existing inventory filters).
+// ================================================================
+
+let scannerTarget = 'regular'; // 'regular' | 'outside'
+let opSelectedRam = '';
+let opSelectedStorage = '';
+let opSelectedNetwork = '';
+const OP_NETWORK_OPTIONS = ['1G','2G','3G','4G','5G'];
+let outsidePickupId = '';
+let outsidePickupImages = [];
+const OUTSIDE_MAX_IMAGES = 5;
+
+// ---- Chip helpers for Outside Pickup ----
+function buildOutsideChips(kind, options, extraClass) {
+    return options.map(o =>
+        `<button type="button" class="spec-chip ${extraClass || ''}" data-kind="${kind}" data-val="${o}" onclick="selectOutsideSpec('${kind}','${o}',this)">${o}</button>`
+    ).join('');
+}
+
+function selectOutsideSpec(kind, val, el) {
+    const group = el.parentElement;
+    const already = el.classList.contains('active');
+    group.querySelectorAll('.spec-chip').forEach(b => b.classList.remove('active'));
+    const finalVal = already ? '' : val;
+    if (!already) el.classList.add('active');
+    if (kind === 'ram') opSelectedRam = finalVal;
+    if (kind === 'storage') opSelectedStorage = finalVal;
+    if (kind === 'network') opSelectedNetwork = finalVal;
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch(_){} }
+    updateOutsideSpecUI();
+}
+
+function updateOutsideSpecUI() {
+    const r = document.getElementById('opRamPick');
+    const s = document.getElementById('opStoragePick');
+    const n = document.getElementById('opNetworkPick');
+    if (r) { r.textContent = opSelectedRam || 'Not selected'; r.className = 'picked' + (opSelectedRam ? '' : ' empty'); }
+    if (s) { s.textContent = opSelectedStorage || 'Not selected'; s.className = 'picked' + (opSelectedStorage ? '' : ' empty'); }
+    if (n) { n.textContent = opSelectedNetwork || 'Not selected'; n.className = 'picked' + (opSelectedNetwork ? '' : ' empty'); }
+}
+
+// ---- ID Reservation (transactional — guarantees uniqueness) ----
+async function reserveOutsidePickupId() {
+    const now = new Date();
+    const yy = String(now.getFullYear()).slice(-2);
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    const dateKey = `${yy}${mm}${dd}`;
+
+    const counterRef = db.ref('outside_pickup_counters/' + dateKey);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const result = await counterRef.transaction(current => {
+                return (current || 0) + 1;
+            });
+            if (result.committed) {
+                const num = result.snapshot.val();
+                return `OP-${dateKey}-${String(num).padStart(4, '0')}`;
+            }
+        } catch (e) {
+            console.warn('ID reservation attempt ' + attempt + ' failed:', e);
+        }
+        await new Promise(r => setTimeout(r, 500));
+    }
+    throw new Error('Could not reserve ID. Please retry.');
+}
+
+// ---- Open / Close Outside Pickup Page ----
+async function openOutsidePickup() {
+    if (!currentUser) { showToast('Please login first', 'error'); return; }
+
+    // Reset state
+    outsidePickupId = '';
+    outsidePickupImages = [];
+    opSelectedRam = ''; opSelectedStorage = ''; opSelectedNetwork = '';
+    hiddenImei2 = '';
+
+    // Switch views: hide tabs, show outside page
+    document.getElementById('mainTabBar').style.display = 'none';
+    document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+    document.getElementById('outsidePickupPage').style.display = 'block';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    // Set placeholder ID, then reserve
+    const idEl = document.getElementById('outsidePickupIdDisplay');
+    if (idEl) idEl.textContent = '⏳ Generating…';
+
+    // Build chips
+    const ramChipsEl = document.getElementById('opRamChips');
+    const stoChipsEl = document.getElementById('opStorageChips');
+    const netChipsEl = document.getElementById('opNetworkChips');
+    if (ramChipsEl) ramChipsEl.innerHTML = buildOutsideChips('ram', RAM_OPTIONS);
+    if (stoChipsEl) stoChipsEl.innerHTML = buildOutsideChips('storage', STORAGE_OPTIONS);
+    if (netChipsEl) netChipsEl.innerHTML = buildOutsideChips('network', OP_NETWORK_OPTIONS, 'net');
+
+    // Reset inputs
+    document.getElementById('opPhoneModel').value = '';
+    document.getElementById('opImei').value = '';
+    document.getElementById('opValue').value = '';
+    document.getElementById('opCustomerName').value = '';
+    document.getElementById('opAadhaarNumber').value = '';
+    document.getElementById('opBillNumber').value = '';
+    document.getElementById('opPhotoPreview').innerHTML = '';
+    document.getElementById('opPhotoInfo').textContent = '0 photos added · min 1 required';
+    updateOutsideSpecUI();
+    lucide.createIcons();
+
+    // Reserve ID
+    try {
+        const id = await reserveOutsidePickupId();
+        outsidePickupId = id;
+        if (idEl) idEl.textContent = id;
+    } catch (e) {
+        console.error('ID generation failed:', e);
+        if (idEl) idEl.textContent = '❌ Failed — Go back and retry';
+        Swal.fire({
+            icon: 'error', title: 'ID Generation Failed',
+            text: 'Could not reserve a unique ID. Please check network and try again.',
+            confirmButtonColor: '#dc2626'
+        });
+    }
+}
+
+async function closeOutsidePickup() {
+    // Confirm discard if form has any data
+    const hasData =
+        (document.getElementById('opPhoneModel')?.value || '').trim() ||
+        (document.getElementById('opImei')?.value || '').trim() ||
+        (document.getElementById('opValue')?.value || '').trim() ||
+        outsidePickupImages.length > 0 ||
+        opSelectedRam || opSelectedStorage || opSelectedNetwork;
+
+    if (hasData) {
+        const c = await Swal.fire({
+            title: 'Discard this pickup?',
+            text: 'Your entered details will be lost.',
+            icon: 'warning', showCancelButton: true,
+            confirmButtonColor: '#dc2626', cancelButtonColor: '#64748b',
+            confirmButtonText: 'Yes, discard', cancelButtonText: 'Stay'
+        });
+        if (!c.isConfirmed) return;
+    }
+
+    // Reset
+    outsidePickupImages = [];
+    outsidePickupId = '';
+    opSelectedRam = ''; opSelectedStorage = ''; opSelectedNetwork = '';
+    hiddenImei2 = '';
+
+    // Switch views back
+    document.getElementById('outsidePickupPage').style.display = 'none';
+    document.getElementById('mainTabBar').style.display = 'flex';
+    switchTab('pickup');
+}
+
+// ---- Photo Handling for Outside Pickup ----
+async function handleOutsidePhotoPick(inputEl) {
+    const files = inputEl.files ? Array.from(inputEl.files) : [];
+    if (!files.length) return;
+    if (outsidePickupImages.length >= OUTSIDE_MAX_IMAGES) {
+        showToast(`Max ${OUTSIDE_MAX_IMAGES} photos`, 'error');
+        inputEl.value = '';
+        return;
+    }
+    const room = OUTSIDE_MAX_IMAGES - outsidePickupImages.length;
+    const infoEl = document.getElementById('opPhotoInfo');
+    if (infoEl) infoEl.textContent = '⏳ Compressing...';
+    for (const f of files.slice(0, room)) {
+        try { outsidePickupImages.push(await compressImageFile(f)); }
+        catch (e) { console.error(e); }
+    }
+    inputEl.value = '';
+    renderOutsidePhotos();
+}
+
+function renderOutsidePhotos() {
+    const preview = document.getElementById('opPhotoPreview');
+    const info = document.getElementById('opPhotoInfo');
+    if (!preview) return;
+    if (!outsidePickupImages.length) {
+        preview.innerHTML = '';
+        if (info) info.textContent = '0 photos added · min 1 required';
+        return;
+    }
+    let totalKB = 0;
+    preview.innerHTML = `<div class="grid grid-cols-3 gap-2">` + outsidePickupImages.map((d, i) => {
+        const kb = Math.round((d.length * 3 / 4) / 1024); totalKB += kb;
+        return `<div class="relative">
+            <img src="${d}" class="w-full h-20 object-cover rounded-lg border border-gray-200" alt="p${i}">
+            <button type="button" onclick="removeOutsidePhoto(${i})" class="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-red-600 text-white text-xs font-bold shadow-md">✕</button>
+            <div class="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-[9px] text-center rounded-b-lg">${kb}KB</div>
+        </div>`;
+    }).join('') + `</div>`;
+    if (info) info.textContent = `✅ ${outsidePickupImages.length}/${OUTSIDE_MAX_IMAGES} · ~${totalKB} KB`;
+}
+
+function removeOutsidePhoto(idx) {
+    outsidePickupImages.splice(idx, 1);
+    renderOutsidePhotos();
+}
+
+// ---- Open Scanner for Outside Pickup ----
+function openOutsideScanner() {
+    scannerTarget = 'outside';
+    startScanner();
+}
+
+// ---- Review & Submit ----
+function escapeHtmlOP(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+async function reviewOutsidePickup() {
+    if (!currentUser) { showToast('Please login first', 'error'); return; }
+    if (!outsidePickupId) {
+        Swal.fire({ icon: 'error', title: 'ID Not Ready', text: 'Pickup ID is not ready yet. Please go back and reopen.', confirmButtonColor: '#dc2626' });
+        return;
+    }
+
+    const phoneModel = (document.getElementById('opPhoneModel').value || '').trim();
+    const imei = (document.getElementById('opImei').value || '').trim();
+    const valueRaw = (document.getElementById('opValue').value || '').trim();
+    const customerName = (document.getElementById('opCustomerName').value || '').trim();
+    const aadhaarNumber = (document.getElementById('opAadhaarNumber').value || '').trim();
+    const billNumber = (document.getElementById('opBillNumber').value || '').trim();
+
+    // Validations
+    if (!phoneModel) { showToast('Enter phone model', 'error'); document.getElementById('opPhoneModel').focus(); return; }
+    if (!imei || imei.length !== 15 || !/^\d{15}$/.test(imei)) {
+        showToast('Enter valid 15-digit IMEI', 'error'); document.getElementById('opImei').focus(); return;
+    }
+    const value = parseInt(valueRaw);
+    if (!value || value <= 0 || isNaN(value)) {
+        showToast('Enter valid agreed value', 'error'); document.getElementById('opValue').focus(); return;
+    }
+    if (!opSelectedRam) { showToast('Select RAM', 'error'); return; }
+    if (!opSelectedStorage) { showToast('Select Storage', 'error'); return; }
+    if (!opSelectedNetwork) { showToast('Select Network', 'error'); return; }
+    if (outsidePickupImages.length < 1) { showToast('Add at least 1 phone photo', 'error'); return; }
+
+    const summaryHtml = `
+        <div style="text-align:left;font-size:13px;line-height:1.6;">
+            <div style="background:linear-gradient(135deg,#faf5ff,#f3e8ff);border:1px solid #d8b4fe;border-radius:12px;padding:10px 12px;margin-bottom:10px;text-align:center;">
+                <div style="font-size:9px;font-weight:800;color:#7c3aed;letter-spacing:1.5px;">PICKUP ID</div>
+                <div style="font-family:monospace;font-size:14px;font-weight:800;color:#4c1d95;margin-top:2px;">${escapeHtmlOP(outsidePickupId)}</div>
+            </div>
+            <p><strong>Model:</strong> ${escapeHtmlOP(phoneModel)}</p>
+            <p><strong>IMEI:</strong> <span style="font-family:monospace;">${escapeHtmlOP(imei)}</span></p>
+            <p><strong>RAM / Storage:</strong> ${opSelectedRam} / ${opSelectedStorage}</p>
+            <p><strong>Network:</strong> ${opSelectedNetwork}</p>
+            <p><strong>Agreed Value:</strong> ₹${value.toLocaleString('en-IN')}</p>
+            <p><strong>Photos:</strong> ${outsidePickupImages.length} uploaded</p>
+            ${customerName ? `<p><strong>Customer:</strong> ${escapeHtmlOP(customerName)}</p>` : ''}
+            ${aadhaarNumber ? `<p><strong>Aadhaar:</strong> ${escapeHtmlOP(aadhaarNumber)}</p>` : ''}
+            ${billNumber ? `<p><strong>Bill No:</strong> ${escapeHtmlOP(billNumber)}</p>` : ''}
+            <div style="margin-top:10px;padding:8px;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;font-size:11px;color:#92400e;">
+                <strong>ℹ️ Status:</strong> Record will be saved as <strong>Pending Approval</strong>. Admin will verify and approve. No WhatsApp message will be sent.
+            </div>
+        </div>`;
+
+    const result = await Swal.fire({
+        title: 'Review Outside Pickup',
+        html: summaryHtml,
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: '✅ Submit for Approval',
+        cancelButtonText: 'Edit',
+        confirmButtonColor: '#7c3aed',
+        cancelButtonColor: '#64748b',
+        width: 'min(520px, 96vw)'
+    });
+    if (result.isConfirmed) submitOutsidePickup();
+}
+
+async function submitOutsidePickup() {
+    if (!currentUser) { showToast('Please login first', 'error'); return; }
+    if (!outsidePickupId) { showToast('Pickup ID missing. Reopen form.', 'error'); return; }
+
+    const phoneModel = (document.getElementById('opPhoneModel').value || '').trim();
+    const imei = (document.getElementById('opImei').value || '').trim();
+    const value = parseInt((document.getElementById('opValue').value || '').trim());
+    const customerName = (document.getElementById('opCustomerName').value || '').trim();
+    const aadhaarNumber = (document.getElementById('opAadhaarNumber').value || '').trim();
+    const billNumber = (document.getElementById('opBillNumber').value || '').trim();
+
+    const pickupId = outsidePickupId;
+
+    try {
+        // Defensive: verify ID doesn't already exist
+        const existingSnap = await db.ref('outside_pickups/' + pickupId).once('value');
+        if (existingSnap.exists()) {
+            // Shouldn't happen with transaction counter, but handle gracefully
+            showToast('⚠️ Pickup ID collision. Regenerating...', 'error');
+            outsidePickupId = await reserveOutsidePickupId();
+            document.getElementById('outsidePickupIdDisplay').textContent = outsidePickupId;
+            return;
+        }
+
+        // Upload photos to Firebase Storage
+        Swal.fire({ title: 'Uploading photos...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+        const photoUrls = [];
+        for (let i = 0; i < outsidePickupImages.length; i++) {
+            try {
+                const blob = await (await fetch(outsidePickupImages[i])).blob();
+                const fileName = `${pickupId}_${i}_${Date.now()}.jpg`;
+                const storageRef = storage.ref(`outside_pickup_docs/${pickupId}/${fileName}`);
+                const snapshot = await storageRef.put(blob, { contentType: 'image/jpeg' });
+                photoUrls.push(await snapshot.ref.getDownloadURL());
+            } catch (e) {
+                console.error('Photo upload failed:', e);
+                Swal.close();
+                showToast('❌ Photo upload failed. Try again.', 'error');
+                return;
+            }
+        }
+
+        const now = new Date();
+        const istDateTime = getISTDateTime();
+
+        const record = {
+            pickupId,
+            status: 'pending',
+            rider: 'Parvameer',
+            agent: currentUser.username,
+            agentName: currentUser.name || currentUser.username,
+            phoneModel,
+            imei,
+            value,
+            ram: opSelectedRam,
+            storage: opSelectedStorage,
+            ramStorage: opSelectedRam + '/' + opSelectedStorage,
+            networkType: opSelectedNetwork,
+            customerName: customerName || '',
+            aadhaarNumber: aadhaarNumber || '',
+            billNumber: billNumber || '',
+            phoneImages: photoUrls,
+            createdAt: Date.now(),
+            timestamp: now.toISOString(),
+            timestampIST: istDateTime,
+            date: now.toLocaleDateString('en-IN'),
+            inventoryCreated: false
+        };
+
+        await db.ref('outside_pickups/' + pickupId).set(record);
+        Swal.close();
+
+        // Success modal
+        Swal.fire({
+            icon: 'success',
+            title: '✅ Submitted for Approval',
+            html: `
+                <div style="text-align:left;">
+                    <div style="background:linear-gradient(135deg,#faf5ff,#f3e8ff);border:2px solid #d8b4fe;border-radius:12px;padding:14px;text-align:center;margin-bottom:12px;">
+                        <div style="font-size:10px;font-weight:800;color:#7c3aed;letter-spacing:1.5px;">PICKUP ID</div>
+                        <div style="font-family:monospace;font-size:16px;font-weight:800;color:#4c1d95;margin-top:4px;word-break:break-all;">${escapeHtmlOP(pickupId)}</div>
+                    </div>
+                    <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:10px;padding:12px;font-size:12px;color:#92400e;text-align:center;">
+                        <strong>⏳ Status: Pending Approval</strong><br>
+                        <span style="font-size:11px;">Admin will verify and approve this pickup. WhatsApp message will be sent by admin after approval.</span>
+                    </div>
+                </div>`,
+            confirmButtonText: 'OK',
+            confirmButtonColor: '#7c3aed',
+            width: 'min(420px, 96vw)'
+        });
+
+        // Reset state and close
+        outsidePickupImages = [];
+        outsidePickupId = '';
+        opSelectedRam = ''; opSelectedStorage = ''; opSelectedNetwork = '';
+        hiddenImei2 = '';
+
+        // Return to pickup tab (without the discard confirmation)
+        document.getElementById('outsidePickupPage').style.display = 'none';
+        document.getElementById('mainTabBar').style.display = 'flex';
+        switchTab('pickup');
+
+    } catch (e) {
+        console.error('Outside pickup submit error:', e);
+        Swal.close();
+        showToast('❌ Submit failed. Please try again.', 'error');
+    }
+}
+
+// ================================================================
+// === SECTION 21: INITIALIZATION (DOMContentLoaded) =============
+// ================================================================
+document.addEventListener('DOMContentLoaded', () => {
+    setupBackNavigation();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'blockedOverlay';
+    overlay.style.cssText = 'display:none; position:fixed; inset:0; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; color:white; font-size:20px; font-weight:bold; flex-direction:column; padding:20px; text-align:center;';
+    overlay.innerHTML = `<i data-lucide="lock" class="w-16 h-16 text-red-500 mb-4"></i><p>🔒 You are blocked for today.</p><p class="text-sm text-gray-400 mt-2">Contact admin to unblock.</p><button onclick="logoutUser()" class="mt-4 bg-red-600 px-6 py-3 rounded-xl">Logout</button>`;
+    document.body.appendChild(overlay);
+    lucide.createIcons();
+
+    document.getElementById('offlineBanner').classList.add('hidden');
+    const loggedIn = checkAuth();
+    if (!loggedIn) {
+        document.getElementById('authOverlay').style.display = 'flex';
+    }
+    if (loggedIn) {
+        loadPendingOrders();
+        const today = getLocalDate();
+        document.getElementById('attendanceDateDisplay').textContent = today;
+        switchTab('pickup');
+    }
+    document.getElementById('loginPassword').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') loginUser();
+    });
+    document.getElementById('loginUsername').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('loginPassword').focus();
+    });
 });
-
-// ==========================================
-// MODAL OUTSIDE-CLICK + ESC
-// ==========================================
-const sellModalEl = document.getElementById('sellModal');
-if (sellModalEl) sellModalEl.addEventListener('click', function (e) { if (e.target === this) closeSellModal(); });
-
-const detailModalEl = document.getElementById('detailModal');
-if (detailModalEl) detailModalEl.addEventListener('click', function (e) { if (e.target === this) closeDetailModal(); });
-
-document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { closeSellModal(); closeDetailModal(); }
-});
-
-// ==========================================
-// EXPOSE FOR INLINE HANDLERS
-// ==========================================
-window.switchSource = switchSource;
-window.switchView = switchView;
-window.applySearch = applySearch;
-window.clearSearch = clearSearch;
-window.openSellModal = openSellModal;
-window.closeSellModal = closeSellModal;
-window.confirmSell = confirmSell;
-window.viewOrderDetail = viewOrderDetail;
-window.closeDetailModal = closeDetailModal;
-window.refreshInventory = refreshInventory;
-
-// Returns
-window.searchSoldPhones = searchSoldPhones;
-window.clearReturnSearch = clearReturnSearch;
-window.selectReturnPhone = selectReturnPhone;
-window.cancelReturnSelection = cancelReturnSelection;
-window.onReturnTypeChange = onReturnTypeChange;
-window.onExchangeSourceChange = onExchangeSourceChange;
-window.onExchangePhoneSelect = onExchangePhoneSelect;
-window.submitReturn = submitReturn;
-window.loadReturnsHistory = loadReturnsHistory;
-window.viewReturnMessage = viewReturnMessage;
