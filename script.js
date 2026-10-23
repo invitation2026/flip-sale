@@ -902,14 +902,23 @@ function clearReturnSearch() {
 }
 
 // ---------- SELECT RETURN PHONE ----------
+function scrollToReturnSettlement() {
+    const settlement = document.getElementById('returnTypeMoneyLabel');
+    if (settlement) settlement.scrollIntoView({ behavior: 'instant', block: 'center' });
+}
+
 function selectReturnPhone(id, source) {
-    if (selectedReturnPhone && selectedReturnPhone.id === id && selectedReturnPhone._source === source) return;
+    if (selectedReturnPhone && selectedReturnPhone.id === id && selectedReturnPhone._source === source) {
+        scrollToReturnSettlement();
+        return;
+    }
     const phone = allSoldPhonesBoth.find(p => p.id === id && p._source === source);
     if (!phone) { showToast('Phone not found', 'error'); return; }
     selectedReturnPhone = phone;
     selectedExchangePhone = null;
     document.querySelectorAll('#returnSearchResults .return-result-card').forEach(el => el.classList.remove('active'));
     renderReturnForm();
+    scrollToReturnSettlement();
 }
 
 function cancelReturnSelection() {
@@ -1385,12 +1394,22 @@ async function loadReturnsHistory() {
         ]);
         const fkData = fkSnap.val() || {};
         const cfData = cfSnap.val() || {};
-        const fkReturns = Object.entries(fkData).map(([id, r]) => ({ id, _source: 'flipkart', ...r }));
-        const cfReturns = Object.entries(cfData).map(([id, r]) => ({ id, _source: 'cashify', ...r }));
-
-        const merged = [...fkReturns, ...cfReturns]
-            .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-            .slice(0, 30);
+        const candidates = [
+            ...Object.entries(fkData).map(([id, r]) => ({ id, _source: 'flipkart', ...r })),
+            ...Object.entries(cfData).map(([id, r]) => ({ id, _source: 'cashify', ...r }))
+        ].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const merged = [];
+        for (let offset = 0; offset < candidates.length && merged.length < 30; offset += 30) {
+            const batch = candidates.slice(offset, offset + 30);
+            const originalPickups = await Promise.all(batch.map(r =>
+                r.originalPickupId
+                    ? getDb(r._source).ref('pickups/' + r.originalPickupId).once('value')
+                    : Promise.resolve(null)
+            ));
+            batch.forEach((r, index) => {
+                if (originalPickups[index]?.exists()) merged.push(r);
+            });
+        }
 
         if (!merged.length) {
             container.innerHTML = `<div class="text-center py-8 text-gray-400 text-sm">No returns recorded yet on either platform</div>`;
