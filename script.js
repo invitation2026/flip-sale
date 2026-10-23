@@ -1,6 +1,10 @@
 // ================================================================
 // Sales Manager · Flipkart + Cashify
 // Dual Firebase · Returns Smart Search (brand-aware, multi-token)
+// + Sales Management Login & Access Control
+// + Sale WhatsApp Message & Recent History
+// + Immediate Revoke Logout (with fallback)
+// v3.2 — Activity view removed
 // ================================================================
 
 // ---------- FIREBASE ----------
@@ -66,40 +70,28 @@ function refreshIcons() { if (window.lucide) { try { lucide.createIcons(); } cat
 // ================================================================
 // SMART SEARCH ENGINE — brand-aware, multi-token
 // ================================================================
-
-// Brand alias map — expand typed brand to all related sub-brands
 const BRAND_ALIASES = {
-    // Apple
     'apple':    ['apple', 'iphone'],
     'iphone':   ['iphone', 'apple'],
-    // Samsung
     'samsung':  ['samsung', 'galaxy'],
     'galaxy':   ['galaxy', 'samsung'],
-    // Xiaomi family
     'xiaomi':   ['xiaomi', 'redmi', 'poco', 'mi'],
     'redmi':    ['redmi', 'xiaomi', 'mi'],
     'poco':     ['poco', 'xiaomi', 'redmi'],
     'mi':       ['mi', 'xiaomi', 'redmi', 'poco'],
-    // Google
     'google':   ['google', 'pixel'],
     'pixel':    ['pixel', 'google'],
-    // Motorola
     'motorola': ['motorola', 'moto'],
     'moto':     ['moto', 'motorola'],
-    // Vivo / iQOO
     'vivo':     ['vivo', 'iqoo'],
     'iqoo':     ['iqoo', 'vivo'],
-    // Sony
     'sony':     ['sony', 'xperia'],
     'xperia':   ['xperia', 'sony'],
-    // Asus
     'asus':     ['asus', 'zenfone', 'rog'],
     'zenfone':  ['zenfone', 'asus'],
     'rog':      ['rog', 'asus'],
-    // Huawei
     'huawei':   ['huawei', 'honor'],
     'honor':    ['honor', 'huawei'],
-    // Others (single-brand, listed for clarity)
     'oneplus':  ['oneplus'],
     'realme':   ['realme'],
     'oppo':     ['oppo'],
@@ -120,45 +112,24 @@ const BRAND_ALIASES = {
 
 function normalizeSearchText(str) {
     if (!str) return '';
-    return String(str)
-        .toLowerCase()
-        .replace(/[^\w\s]/g, ' ')   // non-alphanumeric → space
-        .replace(/\s+/g, ' ')
-        .trim();
+    return String(str).toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Attach precomputed search blobs to a phone record (idempotent)
 function decorateForSearch(item) {
     if (!item) return item;
     if (item._searchBlob !== undefined) return item;
-    const parts = [
-        item.phoneModel,
-        item.brand,
-        item.model,
-        item.orderId,
-        item.id,
-        item.customerName,
-        item.buyerName,
-        item.imei,
-        item.imei2,
-        item.color,
-        item.ram,
-        item.storage,
-        item.ramStorage,
-        item.networkType,
-    ].filter(Boolean);
+    const parts = [item.phoneModel, item.brand, item.model, item.orderId, item.id,
+        item.customerName, item.buyerName, item.imei, item.imei2, item.color,
+        item.ram, item.storage, item.ramStorage, item.networkType].filter(Boolean);
     item._searchBlob = normalizeSearchText(parts.join(' '));
     item._searchBlobCompact = item._searchBlob.replace(/\s+/g, '');
     return item;
 }
 
-// Single token matches blob or its compact form or via brand aliases
 function tokenMatchesBlob(tok, blob, compactBlob) {
     if (!tok) return false;
-    // Direct substring
     if (blob.includes(tok)) return true;
     if (tok.length >= 3 && compactBlob.includes(tok)) return true;
-    // Brand alias expansion
     const aliases = BRAND_ALIASES[tok];
     if (aliases) {
         for (const a of aliases) {
@@ -172,31 +143,22 @@ function tokenMatchesBlob(tok, blob, compactBlob) {
     return false;
 }
 
-// Main matcher
 function phoneMatchesQuery(item, rawQuery) {
     const normQuery = normalizeSearchText(rawQuery);
     if (!normQuery) return true;
-
     const blob = item._searchBlob || '';
     const compactBlob = item._searchBlobCompact || '';
     const compactQuery = normQuery.replace(/\s+/g, '');
     const digits = String(rawQuery || '').replace(/\D/g, '');
 
-    // 1. IMEI / orderId digit match (≥4 digits)
     if (digits.length >= 4) {
         const imei = String(item.imei || '').replace(/\D/g, '');
         const imei2 = String(item.imei2 || '').replace(/\D/g, '');
         const ord = String(item.orderId || item.id || '').replace(/\D/g, '');
         if (imei.includes(digits) || imei2.includes(digits) || ord.includes(digits)) return true;
     }
-
-    // 2. Exact phrase (with spaces)
     if (blob.includes(normQuery)) return true;
-
-    // 3. Exact phrase (compact — no spaces)
     if (compactQuery && compactBlob.includes(compactQuery)) return true;
-
-    // 4. Token-based (each typed token must match via substring or brand alias)
     const tokens = normQuery.split(' ').filter(Boolean);
     if (!tokens.length) return false;
     for (const tok of tokens) {
@@ -215,11 +177,20 @@ let filteredInventory = [];
 let sellOrderData = null;
 let isRefreshing = false;
 
+// Sales manager auth state
+let currentSalesUser = null;
+const SALES_AUTH_KEY = 'sales_manager_user';
+
+// Access listener — immediate revoke detection
+let accessRevokedFlag = false;
+let accessListenerRef = null;
+let fallbackCheckInterval = null;
+
 const overheadCache = { flipkart: { ts: 0, value: 0 }, cashify: { ts: 0, value: 0 } };
 const OVERHEAD_TTL = 10 * 60 * 1000;
 const lastUpdatedBySource = { flipkart: null, cashify: null };
 
-// Returns state — cache-first (no re-fetch per keystroke)
+// Returns state
 let allSoldPhonesBoth = [];
 let filteredReturnResults = [];
 let selectedReturnPhone = null;
@@ -269,15 +240,17 @@ function setupOfflineDetection() {
 }
 
 // ================================================================
-// VIEW TOGGLE
+// VIEW TOGGLE (2 tabs: Inventory / Returns)
 // ================================================================
 function switchView(view) {
     if (view !== 'inventory' && view !== 'returns') return;
+    if (accessRevokedFlag) { showLoginOverlay(); return; }
     if (currentView === view) return;
     currentView = view;
 
-    document.getElementById('viewBtnInventory').classList.toggle('active', view === 'inventory');
-    document.getElementById('viewBtnReturns').classList.toggle('active', view === 'returns');
+    document.getElementById('viewBtnInventory')?.classList.toggle('active', view === 'inventory');
+    document.getElementById('viewBtnReturns')?.classList.toggle('active', view === 'returns');
+
     document.getElementById('inventoryView').style.display = view === 'inventory' ? 'block' : 'none';
     document.getElementById('returnsView').style.display = view === 'returns' ? 'block' : 'none';
 
@@ -288,9 +261,10 @@ function switchView(view) {
 }
 
 // ================================================================
-// INVENTORY (unchanged)
+// INVENTORY
 // ================================================================
 function switchSource(source) {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     if (source !== 'flipkart' && source !== 'cashify') return;
     if (currentSource === source) return;
     currentSource = source;
@@ -537,6 +511,7 @@ async function getOverheadPerPhone(source, force = false) {
 
 // ---------- SELL MODAL ----------
 function openSellModal(orderId) {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     const order = inventoryList.find(item => item.id === orderId);
     if (!order) { showToast('Order not found in inventory', 'error'); return; }
     sellOrderData = order;
@@ -576,6 +551,7 @@ function closeSellModal() {
 }
 
 async function confirmSell() {
+    if (!(await assertSalesAccess())) return;
     if (!sellOrderData) return;
     const salePriceRaw = document.getElementById('sellSalePrice').value.trim();
     const buyerName = document.getElementById('sellBuyerName').value.trim();
@@ -602,6 +578,7 @@ async function confirmSell() {
                 <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
                 <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
                 <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
+                <p style="margin-top:6px;font-size:12px;color:#64748b;">🧑‍💼 Recording as: <strong>${escapeHtml(currentSalesUser.name)}</strong> (${escapeHtml(currentSalesUser.username)})</p>
             </div>`,
         icon: 'question',
         showCancelButton: true,
@@ -623,7 +600,9 @@ async function confirmSell() {
         let writePayload = {
             sold: true, returned: false,
             salePrice, buyerName, buyerContact: buyerContact || '', saleDate,
-            saleTimestamp: new Date().toISOString()
+            saleTimestamp: new Date().toISOString(),
+            salesBy: currentSalesUser.username,
+            salesByName: currentSalesUser.name
         };
 
         if (source === 'flipkart') {
@@ -646,15 +625,24 @@ async function confirmSell() {
         }
 
         await getDb(source).ref('pickups/' + order.id).update(writePayload);
-        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
-        closeSellModal();
 
-        // Invalidate returns cache
         allSoldPhonesBoth = [];
         allExchangeInventoryBoth = [];
         returnsDataLoaded = false;
 
         await loadInventory();
+        await loadRecentSalesHistory();
+
+        closeSellModal();
+
+        let stockCount = 0;
+        try { stockCount = await getSourceInventoryCount(source); } catch (_) {}
+
+        const mergedItem = { ...order, ...writePayload };
+        const message = buildSaleMessage(mergedItem, salePrice, source, stockCount);
+        await showSaleSuccessModal(message);
+
+        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
     } catch (e) {
         console.error('Sale error:', e);
         showToast('Error saving sale. Please try again.', 'error');
@@ -669,6 +657,7 @@ async function confirmSell() {
 
 // ---------- VIEW DETAIL ----------
 async function viewOrderDetail(orderId, sourceOverride) {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     const modal = document.getElementById('detailModal');
     const content = document.getElementById('detailContent');
     if (!modal || !content) return;
@@ -701,6 +690,7 @@ async function viewOrderDetail(orderId, sourceOverride) {
                 <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${Number(item.salePrice || item.lastSalePrice || 0).toLocaleString('en-IN')}</div></div>
                 <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(item.buyerName || item.lastBuyerName || '—')}</div></div>
                 <div class="detail-item"><div class="label">Sale Date</div><div class="value">${escapeHtml(item.saleDate || item.lastSaleDate || '—')}</div></div>
+                ${item.salesByName ? `<div class="detail-item"><div class="label">Sold By</div><div class="value">${escapeHtml(item.salesByName)}${item.salesBy ? ' <span style="color:#94a3b8;font-size:11px;">(' + escapeHtml(item.salesBy) + ')</span>' : ''}</div></div>` : ''}
                 ${isReturned ? `<div class="detail-item"><div class="label">Return Date</div><div class="value" style="color:#dc2626;">${escapeHtml(item.returnDate || '—')}</div></div>` : ''}
             `;
         }
@@ -740,6 +730,7 @@ function closeDetailModal() {
 
 // ---------- REFRESH (view-aware) ----------
 async function refreshInventory() {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     if (isRefreshing) return;
     isRefreshing = true;
     showToast('🔄 Refreshing…', 'info', 1200);
@@ -753,12 +744,15 @@ async function refreshInventory() {
         overheadCache[currentSource] = { ts: 0, value: 0 };
         await loadInventory();
     }
+
+    try { await loadRecentSalesHistory(); } catch (_) {}
+
     isRefreshing = false;
     showToast('✅ Refreshed', 'success', 1500);
 }
 
 // ================================================================
-// RETURNS — Smart Search (brand-aware)
+// RETURNS
 // ================================================================
 async function initReturnsView() {
     try {
@@ -901,7 +895,6 @@ function clearReturnSearch() {
     renderReturnSearchResults('');
 }
 
-// ---------- SELECT RETURN PHONE ----------
 function scrollToReturnSettlement() {
     const settlement = document.getElementById('returnTypeMoneyLabel');
     if (settlement) settlement.scrollIntoView({ behavior: 'instant', block: 'center' });
@@ -1154,6 +1147,7 @@ function clearExchangeSearchInput() {
 
 // ---------- SUBMIT RETURN ----------
 async function submitReturn() {
+    if (!(await assertSalesAccess())) return;
     if (!selectedReturnPhone) { showToast('Please select a sold phone first', 'error'); return; }
     const returnDate = document.getElementById('returnDate').value || getLocalYMD();
     const type = document.querySelector('input[name="returnType"]:checked')?.value || 'money';
@@ -1235,7 +1229,9 @@ async function submitReturn() {
             exchangeModel: type === 'exchange' ? (exchangePhone.phoneModel || '—') : null,
             exchangeImei: type === 'exchange' ? (exchangePhone.imei || '—') : null,
             createdAt: Date.now(),
-            createdBy: 'sales-manager'
+            createdBy: 'sales-manager',
+            createdByName: currentSalesUser ? currentSalesUser.name : '',
+            createdByUsername: currentSalesUser ? currentSalesUser.username : ''
         };
 
         await originalDb.ref('returns/' + returnId).set(returnRecord);
@@ -1260,7 +1256,9 @@ async function submitReturn() {
                 saleTimestamp: new Date().toISOString(),
                 soldVia: 'exchange',
                 exchangeForReturnId: returnId,
-                exchangeForOrderId: original.orderId || original.id
+                exchangeForOrderId: original.orderId || original.id,
+                salesBy: currentSalesUser ? currentSalesUser.username : '',
+                salesByName: currentSalesUser ? currentSalesUser.name : ''
             };
             if (exchangePhone._source === 'flipkart') {
                 exchangePayload.commission = 0;
@@ -1303,7 +1301,7 @@ async function submitReturn() {
         await refreshSoldPhonesCache();
         returnsDataLoaded = true;
         renderReturnSearchResults(document.getElementById('returnSearch')?.value || '');
-        await Promise.all([loadReturnsHistory(), loadReturnsInventoryCounts()]);
+        await Promise.all([loadReturnsHistory(), loadReturnsInventoryCounts(), loadRecentSalesHistory()]);
         if (currentView === 'inventory') loadInventory();
 
         showReturnSuccessModal(message);
@@ -1453,6 +1451,7 @@ async function loadReturnsHistory() {
 }
 
 async function viewReturnMessage(source, returnId) {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     try {
         const snap = await getDb(source).ref('returns/' + returnId).once('value');
         const record = snap.val();
@@ -1465,27 +1464,745 @@ async function viewReturnMessage(source, returnId) {
 }
 
 // ================================================================
+// AUTHENTICATION — SALES MANAGEMENT LOGIN
+// ================================================================
+
+function injectLoginUI() {
+    if (document.getElementById('salesLoginOverlay')) return;
+
+    if (!document.getElementById('salesLoginStyles')) {
+        const st = document.createElement('style');
+        st.id = 'salesLoginStyles';
+        st.textContent = `
+            .sales-login-overlay {
+                position: fixed; inset: 0; z-index: 99999;
+                display: flex; align-items: center; justify-content: center;
+                background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+                padding: 18px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            .sales-login-box {
+                background: #fff; border-radius: 24px;
+                max-width: 400px; width: 100%; padding: 28px 24px;
+                box-shadow: 0 30px 70px rgba(0,0,0,0.35);
+            }
+            .sales-login-logo {
+                width: 64px; height: 64px; margin: 0 auto 14px;
+                background: linear-gradient(135deg, #4f46e5, #7c3aed);
+                border-radius: 18px;
+                display: flex; align-items: center; justify-content: center;
+                box-shadow: 0 10px 28px rgba(79,70,229,0.4);
+                font-size: 30px;
+            }
+            .sales-login-box h2 {
+                font-size: 22px; font-weight: 800; color: #0f172a;
+                text-align: center; margin-bottom: 4px;
+            }
+            .sales-login-box .sub {
+                text-align: center; color: #94a3b8; font-size: 13px;
+                margin-bottom: 22px;
+            }
+            .sales-login-field { margin-bottom: 14px; }
+            .sales-login-field label {
+                font-size: 12px; font-weight: 700; color: #334155;
+                display: block; margin-bottom: 6px; letter-spacing: 0.3px;
+            }
+            .sales-login-field input {
+                width: 100%; padding: 12px 14px;
+                border: 2px solid #e2e8f0; border-radius: 12px;
+                font-size: 15px; outline: none;
+                transition: border 0.2s, box-shadow 0.2s;
+                background: #fff; box-sizing: border-box;
+            }
+            .sales-login-field input:focus {
+                border-color: #4f46e5;
+                box-shadow: 0 0 0 3px rgba(79,70,229,0.1);
+            }
+            .sales-login-btn {
+                width: 100%; padding: 14px;
+                border: none; border-radius: 14px;
+                font-size: 15px; font-weight: 700;
+                color: #fff; cursor: pointer;
+                background: linear-gradient(135deg, #4f46e5, #7c3aed);
+                margin-top: 6px;
+                transition: opacity 0.2s, transform 0.1s;
+                font-family: inherit;
+            }
+            .sales-login-btn:active { transform: scale(0.97); }
+            .sales-login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+            .sales-login-err {
+                color: #dc2626; font-size: 12px;
+                margin-top: 4px; text-align: center;
+                display: none;
+            }
+            .sales-user-badge {
+                display: inline-flex; align-items: center; gap: 6px;
+                background: #eef2ff; color: #4338ca;
+                padding: 5px 10px;
+                border-radius: 24px;
+                font-size: 12px; font-weight: 700;
+                border: 1px solid #c7d2fe;
+                max-width: 160px;
+            }
+            .sales-user-badge .uname {
+                overflow: hidden; text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .sales-user-badge button {
+                background: none; border: none; padding: 2px;
+                color: #6366f1; cursor: pointer;
+                display: inline-flex; align-items: center;
+                flex-shrink: 0;
+            }
+            .sales-user-badge button:hover { color: #dc2626; }
+
+            .sm-history-wrap { margin-top: 22px; margin-bottom: 22px; }
+            .sm-history-head {
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 14px 18px;
+                background: linear-gradient(135deg, #eef2ff, #e0e7ff);
+                border-radius: 16px 16px 0 0;
+                border: 1px solid #c7d2fe;
+                border-bottom: none;
+            }
+            .sm-history-head h3 {
+                font-size: 14px; font-weight: 800; color: #3730a3;
+                display: flex; align-items: center; gap: 8px;
+                margin: 0;
+            }
+            .sm-history-head button {
+                background: #fff; border: 1px solid #c7d2fe;
+                color: #4f46e5; font-weight: 700; font-size: 11px;
+                padding: 6px 12px; border-radius: 10px;
+                cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+                font-family: inherit;
+            }
+            .sm-history-head button:active { transform: scale(0.96); }
+            .sm-history-body {
+                background: #fff;
+                border: 1px solid #c7d2fe;
+                border-radius: 0 0 16px 16px;
+                padding: 10px;
+                display: flex; flex-direction: column; gap: 8px;
+            }
+            .sm-history-item {
+                padding: 12px 14px;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                transition: background 0.15s;
+            }
+            .sm-history-item:hover { background: #f1f5f9; }
+            .sm-history-item .h-top {
+                display: flex; align-items: flex-start; justify-content: space-between;
+                gap: 8px; margin-bottom: 4px;
+            }
+            .sm-history-item .h-order {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-weight: 800; font-size: 13px; color: #0f172a;
+                word-break: break-all;
+            }
+            .sm-history-item .h-model {
+                font-size: 13px; color: #334155;
+                margin-top: 2px; font-weight: 600;
+            }
+            .sm-history-item .h-meta {
+                font-size: 11px; color: #64748b;
+                display: flex; flex-wrap: wrap; gap: 10px;
+                margin-top: 4px;
+            }
+            .sm-history-item .h-meta strong { color: #0f172a; font-weight: 700; }
+            .sm-history-item .h-actions {
+                display: flex; gap: 6px; margin-top: 8px;
+                flex-wrap: wrap;
+            }
+            .sm-history-btn {
+                padding: 6px 12px; border-radius: 8px;
+                border: none; cursor: pointer;
+                font-size: 11px; font-weight: 700;
+                display: inline-flex; align-items: center; gap: 4px;
+                font-family: inherit;
+            }
+            .sm-history-btn.copy { background: #dcfce7; color: #166534; }
+            .sm-history-btn.copy:hover { background: #bbf7d0; }
+            .sm-history-btn.view { background: #e0e7ff; color: #3730a3; }
+            .sm-history-btn.view:hover { background: #c7d2fe; }
+            .sm-history-empty {
+                padding: 24px 12px; text-align: center;
+                color: #94a3b8; font-size: 13px;
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'salesLoginOverlay';
+    overlay.className = 'sales-login-overlay';
+    overlay.innerHTML = `
+        <div class="sales-login-box">
+            <div class="sales-login-logo">🛒</div>
+            <h2>Sales Manager</h2>
+            <p class="sub">Login to manage sales &amp; returns</p>
+            <div class="sales-login-field">
+                <label>USERNAME</label>
+                <input type="text" id="salesLoginUsername" autocomplete="username" placeholder="Enter username">
+            </div>
+            <div class="sales-login-field">
+                <label>PASSWORD</label>
+                <input type="password" id="salesLoginPassword" autocomplete="current-password" placeholder="Enter password">
+            </div>
+            <div id="salesLoginError" class="sales-login-err"></div>
+            <button class="sales-login-btn" id="salesLoginBtn" onclick="attemptSalesLogin()">Login</button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    setTimeout(() => {
+        const u = document.getElementById('salesLoginUsername');
+        const p = document.getElementById('salesLoginPassword');
+        if (u) u.addEventListener('keydown', e => { if (e.key === 'Enter') p?.focus(); });
+        if (p) p.addEventListener('keydown', e => { if (e.key === 'Enter') attemptSalesLogin(); });
+    }, 50);
+}
+
+// ================================================================
+// ACCESS CONTROL — Immediate Revoke + Per-Action Verify
+// ================================================================
+function verifySalesAccess(userData) {
+    if (!userData) return { ok: false, reason: 'not_found' };
+    if (userData.is_active === false) return { ok: false, reason: 'inactive' };
+    if (userData.forceLogout === true) return { ok: false, reason: 'force_logout' };
+
+    const role = userData.role || 'agent';
+
+    // Admins bypass UNLESS explicitly revoked via sales_access: false
+    if (role === 'admin') {
+        if (userData.sales_access === false) {
+            return { ok: false, reason: 'no_access' };
+        }
+        return { ok: true };
+    }
+
+    if (userData.sales_access === true) return { ok: true };
+    return { ok: false, reason: 'no_access' };
+}
+
+function startAccessListener() {
+    if (!currentSalesUser) return;
+    stopAccessListener();
+    accessRevokedFlag = false;
+
+    const uname = currentSalesUser.username;
+    console.log('[SalesManager] ✅ Access listener attached for:', uname);
+
+    accessListenerRef = flipkartDb.ref('users/' + uname);
+    accessListenerRef.on('value', snapshot => {
+        console.log('[SalesManager] 🔔 Access listener fired for', uname, '→', snapshot.val());
+
+        if (!snapshot.exists()) {
+            forceLogout('Your account has been removed.');
+            return;
+        }
+
+        const data = snapshot.val();
+        const access = verifySalesAccess(data);
+
+        if (!access.ok) {
+            let reason = 'Your Sales Management access has been revoked by admin.';
+            if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
+            if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
+
+            forceLogout(reason);
+
+            if (access.reason === 'force_logout') {
+                setTimeout(() => {
+                    flipkartDb.ref('users/' + uname + '/forceLogout').remove().catch(() => {});
+                }, 500);
+            }
+            return;
+        }
+
+        currentSalesUser.name = data.name || currentSalesUser.username;
+        currentSalesUser.role = data.role || 'agent';
+        currentSalesUser.isAdmin = (data.role || 'agent') === 'admin';
+    }, err => {
+        console.error('[SalesManager] ❌ Access listener error:', err);
+    });
+}
+
+function stopAccessListener() {
+    if (accessListenerRef) {
+        try { accessListenerRef.off(); } catch (_) {}
+        accessListenerRef = null;
+    }
+}
+
+function forceLogout(reason) {
+    console.log('[SalesManager] 🚪 forceLogout called:', reason);
+    accessRevokedFlag = true;
+    stopAccessListener();
+    currentSalesUser = null;
+    try { localStorage.removeItem(SALES_AUTH_KEY); } catch (_) {}
+    document.querySelector('.sales-user-badge')?.remove();
+    try { Swal.close(); } catch (_) {}
+    try { closeSellModal?.(); } catch (_) {}
+    try { closeDetailModal?.(); } catch (_) {}
+    try { cancelReturnSelection?.(); } catch (_) {}
+    showLoginOverlay();
+
+    setTimeout(() => {
+        Swal.fire({
+            icon: 'warning',
+            title: '🔒 Session Ended',
+            text: reason || 'Your access has been revoked.',
+            confirmButtonColor: '#dc2626',
+            allowOutsideClick: false,
+            allowEscapeKey: false
+        });
+    }, 100);
+}
+
+function isStillAuthorized() {
+    return !accessRevokedFlag && currentSalesUser !== null;
+}
+
+async function assertSalesAccess() {
+    if (!isStillAuthorized()) {
+        showLoginOverlay();
+        return false;
+    }
+    try {
+        const snap = await flipkartDb.ref('users/' + currentSalesUser.username).once('value');
+        if (!snap.exists()) {
+            forceLogout('Your account has been removed.');
+            return false;
+        }
+        const access = verifySalesAccess(snap.val());
+        if (!access.ok) {
+            let reason = 'Sales Management access revoked.';
+            if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
+            if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
+            forceLogout(reason);
+            return false;
+        }
+        return true;
+    } catch (e) {
+        console.error('Access check failed:', e);
+        showToast('Could not verify access. Check network.', 'error');
+        return false;
+    }
+}
+
+// ---------- LOGIN / LOGOUT ----------
+async function attemptSalesLogin() {
+    const userEl = document.getElementById('salesLoginUsername');
+    const passEl = document.getElementById('salesLoginPassword');
+    const errEl = document.getElementById('salesLoginError');
+    const btn = document.getElementById('salesLoginBtn');
+
+    const username = (userEl?.value || '').trim().toLowerCase();
+    const password = (passEl?.value || '').trim();
+
+    if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+    if (!username || !password) {
+        if (errEl) { errEl.textContent = 'Enter username and password'; errEl.style.display = 'block'; }
+        return;
+    }
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Logging in…'; }
+
+    try {
+        const snap = await flipkartDb.ref('users/' + username).once('value');
+        if (!snap.exists()) {
+            if (errEl) { errEl.textContent = 'User not found'; errEl.style.display = 'block'; }
+            return;
+        }
+        const userData = snap.val();
+        if (userData.password !== password) {
+            if (errEl) { errEl.textContent = 'Incorrect password'; errEl.style.display = 'block'; }
+            return;
+        }
+        const access = verifySalesAccess(userData);
+        if (!access.ok) {
+            let msg = 'Access denied';
+            if (access.reason === 'inactive') msg = 'Account inactive. Contact admin.';
+            else if (access.reason === 'no_access') msg = 'Sales Management access not granted. Ask admin to enable it.';
+            else if (access.reason === 'force_logout') msg = 'You were logged out by admin. Try again.';
+            if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+
+            if (access.reason === 'force_logout') {
+                flipkartDb.ref('users/' + username + '/forceLogout').remove().catch(() => {});
+            }
+            return;
+        }
+
+        currentSalesUser = {
+            username,
+            name: userData.name || username,
+            role: userData.role || 'agent',
+            isAdmin: (userData.role || 'agent') === 'admin'
+        };
+        try { localStorage.setItem(SALES_AUTH_KEY, JSON.stringify(currentSalesUser)); } catch (_) {}
+        accessRevokedFlag = false;
+        startAccessListener();
+
+        hideLoginOverlay();
+        showUserBadge();
+        showToast('✅ Welcome, ' + currentSalesUser.name, 'success');
+        initAppAfterLogin();
+    } catch (e) {
+        console.error('Sales login error:', e);
+        if (errEl) { errEl.textContent = 'Login failed. Check network.'; errEl.style.display = 'block'; }
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Login'; }
+    }
+}
+
+function hideLoginOverlay() {
+    const o = document.getElementById('salesLoginOverlay');
+    if (o) o.style.display = 'none';
+}
+
+function showLoginOverlay() {
+    const o = document.getElementById('salesLoginOverlay');
+    if (o) {
+        o.style.display = 'flex';
+        const u = document.getElementById('salesLoginUsername');
+        const p = document.getElementById('salesLoginPassword');
+        if (u) u.value = '';
+        if (p) p.value = '';
+        setTimeout(() => u?.focus(), 200);
+    }
+}
+
+function showUserBadge() {
+    if (!currentSalesUser) return;
+    const refreshBtn = document.querySelector('button[onclick="refreshInventory()"]');
+    if (!refreshBtn) return;
+    const parent = refreshBtn.parentElement;
+    if (!parent) return;
+    parent.querySelector('.sales-user-badge')?.remove();
+
+    const badge = document.createElement('div');
+    badge.className = 'sales-user-badge';
+    badge.innerHTML = `
+        <span class="uname" title="${escapeHtml(currentSalesUser.name)} (${escapeHtml(currentSalesUser.username)})">${escapeHtml(currentSalesUser.name)}</span>
+        <button onclick="logoutSalesUser()" title="Logout">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+    `;
+    parent.insertBefore(badge, refreshBtn);
+}
+
+function logoutSalesUser() {
+    stopAccessListener();
+    accessRevokedFlag = false;
+    currentSalesUser = null;
+    try { localStorage.removeItem(SALES_AUTH_KEY); } catch (_) {}
+    document.querySelector('.sales-user-badge')?.remove();
+    showLoginOverlay();
+    showToast('Logged out', 'info');
+}
+
+function initAppAfterLogin() {
+    loadInventory();
+    loadRecentSalesHistory();
+    refreshIcons();
+}
+
+async function checkSalesSession() {
+    try {
+        const stored = localStorage.getItem(SALES_AUTH_KEY);
+        if (!stored) return false;
+        const parsed = JSON.parse(stored);
+        if (!parsed || !parsed.username) return false;
+
+        const snap = await flipkartDb.ref('users/' + parsed.username).once('value');
+        if (!snap.exists()) return false;
+        const userData = snap.val();
+        const access = verifySalesAccess(userData);
+        if (!access.ok) return false;
+
+        currentSalesUser = {
+            username: parsed.username,
+            name: userData.name || parsed.username,
+            role: userData.role || 'agent',
+            isAdmin: (userData.role || 'agent') === 'admin'
+        };
+        accessRevokedFlag = false;
+        startAccessListener();
+        return true;
+    } catch (e) {
+        console.warn('Session check failed:', e);
+        return false;
+    }
+}
+
+// ================================================================
+// SALE WHATSAPP MESSAGE
+// ================================================================
+
+async function getSourceInventoryCount(source) {
+    const snap = await getDb(source).ref('pickups').once('value');
+    const data = snap.val() || {};
+    let count = 0;
+    Object.values(data).forEach(item => {
+        if (item && item.status === 'pickup' && !item.sold) count++;
+    });
+    return count;
+}
+
+function buildSaleMessage(item, salePrice, source, inventoryCount) {
+    const sourceLabel = source === 'cashify' ? 'CASHIFY' : 'FLIPKART';
+    const model = item.phoneModel || '—';
+    const imei = item.imei || '—';
+    const ramStorage = item.ramStorage
+        || ((item.ram || item.storage) ? `${item.ram || '—'}/${item.storage || '—'}` : '—');
+    const network = item.networkType || '—';
+    const buyerName = item.buyerName || '—';
+    const buyerContact = item.buyerContact || '';
+    const saleDate = item.saleDate
+        || (item.saleTimestamp ? new Date(item.saleTimestamp).toISOString().slice(0, 10) : '—');
+    const salesByName = item.salesByName || item.salesBy || '(not tracked)';
+    const salesByUname = item.salesBy || '';
+    const pickupAgent = item.agent || '';
+
+    const lines = [];
+    lines.push(`🛒 *SALE COMPLETED — ${sourceLabel}*`);
+    lines.push('━━━━━━━━━━━━━━━━━━━━');
+    lines.push(`📦 Order ID: ${item.orderId || item.id || '—'}`);
+    lines.push(`📱 Model: ${model}`);
+    lines.push(`🔖 IMEI: ${imei}`);
+    lines.push(`💾 RAM/ROM: ${ramStorage}`);
+    lines.push(`🌐 Network: ${network}`);
+    lines.push('━━━━━━━━━━━━━━━━━━━━');
+    lines.push(`💰 Sale Price: ₹${Number(salePrice).toLocaleString('en-IN')}`);
+    lines.push(`👤 Buyer: ${buyerName}`);
+    if (buyerContact) lines.push(`📞 Contact: ${buyerContact}`);
+    lines.push(`📅 Sale Date: ${saleDate}`);
+    lines.push('━━━━━━━━━━━━━━━━━━━━');
+    lines.push(`🧑‍💼 Sold by: ${salesByName}${salesByUname ? ' (' + salesByUname + ')' : ''}`);
+    if (pickupAgent && pickupAgent !== salesByUname) {
+        lines.push(`🚚 Pickup Agent: ${pickupAgent}`);
+    }
+    const stockLabel = sourceLabel === 'CASHIFY' ? 'Cashify' : 'Flipkart';
+    lines.push(`📦 Remaining ${stockLabel} Stock: ${inventoryCount} units`);
+    lines.push('━━━━━━━━━━━━━━━━━━━━');
+
+    return lines.join('\n');
+}
+
+async function showSaleSuccessModal(message) {
+    const result = await Swal.fire({
+        title: '✅ Sale Recorded!',
+        html: `
+            <div style="text-align:left;">
+                <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
+                <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
+            </div>`,
+        showDenyButton: true,
+        showCancelButton: true,
+        confirmButtonText: '📋 Copy Message',
+        denyButtonText: '📱 Open WhatsApp',
+        cancelButtonText: 'Close',
+        confirmButtonColor: '#059669',
+        denyButtonColor: '#25D366',
+        cancelButtonColor: '#64748b',
+        width: 'min(560px, 96vw)'
+    });
+    if (result.isConfirmed) await copyTextToClipboard(message);
+    else if (result.isDenied) openWhatsApp(message);
+}
+
+// ================================================================
+// RECENT SALES HISTORY (last 7, both platforms)
+// ================================================================
+
+function injectRecentHistoryUI() {
+    if (document.getElementById('smHistoryWrap')) return;
+    const mainContainer = document.querySelector('.max-w-6xl');
+    if (!mainContainer) return;
+
+    const wrap = document.createElement('div');
+    wrap.id = 'smHistoryWrap';
+    wrap.className = 'sm-history-wrap';
+    wrap.innerHTML = `
+        <div class="sm-history-head">
+            <h3>🕒 Recent Sales History <span style="font-size:11px;font-weight:600;color:#6366f1;">(Last 7)</span></h3>
+            <button onclick="loadRecentSalesHistory()">🔄 Refresh</button>
+        </div>
+        <div class="sm-history-body" id="smHistoryBody">
+            <div class="sm-history-empty">Loading…</div>
+        </div>
+    `;
+    mainContainer.appendChild(wrap);
+}
+
+async function loadRecentSalesHistory() {
+    if (!currentSalesUser) return;
+    const body = document.getElementById('smHistoryBody');
+    if (!body) return;
+
+    try {
+        const [fkSnap, cfSnap] = await Promise.all([
+            flipkartDb.ref('pickups').once('value'),
+            cashifyDb.ref('pickups').once('value')
+        ]);
+        const fk = fkSnap.val() || {};
+        const cf = cfSnap.val() || {};
+
+        const isSold = (item) => item && item.sold === true && item.status === 'pickup';
+
+        const fkSold = Object.entries(fk)
+            .filter(([_, item]) => isSold(item))
+            .map(([id, item]) => ({ ...item, id, _source: 'flipkart' }));
+        const cfSold = Object.entries(cf)
+            .filter(([_, item]) => isSold(item))
+            .map(([id, item]) => ({ ...item, id, _source: 'cashify' }));
+
+        const all = [...fkSold, ...cfSold]
+            .sort((a, b) => {
+                const ta = new Date(a.saleTimestamp || 0).getTime() || 0;
+                const tb = new Date(b.saleTimestamp || 0).getTime() || 0;
+                return tb - ta;
+            })
+            .slice(0, 7);
+
+        renderRecentSalesHistory(all);
+    } catch (e) {
+        console.error('Recent sales load error:', e);
+        body.innerHTML = '<div class="sm-history-empty">Failed to load recent sales</div>';
+    }
+}
+
+function renderRecentSalesHistory(sales) {
+    const body = document.getElementById('smHistoryBody');
+    if (!body) return;
+
+    if (!sales.length) {
+        body.innerHTML = '<div class="sm-history-empty">No sales recorded yet</div>';
+        return;
+    }
+
+    let html = '';
+    sales.forEach(s => {
+        const srcLabel = s._source === 'cashify' ? 'Cashify' : 'Flipkart';
+        const pillColor = s._source === 'cashify' ? '#E6FAF6' : '#eef2ff';
+        const pillText = s._source === 'cashify' ? '#0FA88B' : '#4338ca';
+        const pillBorder = s._source === 'cashify' ? '#a7f3d0' : '#c7d2fe';
+
+        const salePrice = Number(s.salePrice) || 0;
+        const saleDate = s.saleDate
+            || (s.saleTimestamp ? new Date(s.saleTimestamp).toISOString().slice(0, 10) : '—');
+        const soldBy = s.salesByName || s.salesBy || s.agent || '—';
+        const buyer = s.buyerName || '—';
+
+        const safeId = String(s.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const safeSrc = s._source;
+
+        html += `
+            <div class="sm-history-item">
+                <div class="h-top">
+                    <div style="min-width:0;flex:1;">
+                        <div class="h-order">${escapeHtml(s.orderId || s.id)}</div>
+                        <div class="h-model">${escapeHtml(s.phoneModel || '—')}</div>
+                    </div>
+                    <span style="display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:800;background:${pillColor};color:${pillText};border:1px solid ${pillBorder};white-space:nowrap;">${srcLabel}</span>
+                </div>
+                <div class="h-meta">
+                    <span>💰 <strong>₹${salePrice.toLocaleString('en-IN')}</strong></span>
+                    <span>📅 ${escapeHtml(saleDate)}</span>
+                    <span>🧑‍💼 ${escapeHtml(soldBy)}</span>
+                    <span>👤 ${escapeHtml(buyer)}</span>
+                </div>
+                <div class="h-actions">
+                    <button class="sm-history-btn copy" onclick="copySaleMessageForHistory('${safeSrc}', '${safeId}')">📋 Copy Message</button>
+                    <button class="sm-history-btn view" onclick="viewOrderDetail('${safeId}', '${safeSrc}')">👁 View</button>
+                </div>
+            </div>
+        `;
+    });
+    body.innerHTML = html;
+}
+
+async function copySaleMessageForHistory(source, id) {
+    if (!(await assertSalesAccess())) return;
+    try {
+        const snap = await getDb(source).ref('pickups/' + id).once('value');
+        const item = snap.val();
+        if (!item) {
+            showToast('Sale not found', 'error');
+            return;
+        }
+        let count = 0;
+        try { count = await getSourceInventoryCount(source); } catch (_) {}
+        const msg = buildSaleMessage(item, item.salePrice || 0, source, count);
+        await copyTextToClipboard(msg);
+    } catch (e) {
+        console.error('History copy error:', e);
+        showToast('Failed to copy message', 'error');
+    }
+}
+
+// ================================================================
 // INIT
 // ================================================================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     setupOfflineDetection();
+    injectLoginUI();
+    injectRecentHistoryUI();
     refreshIcons();
 
     document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.source === currentSource);
     });
 
-    loadInventory();
+    const hasSession = await checkSalesSession();
 
-    // Auto-refresh — view-aware; never touches returns search input/form
+    if (hasSession) {
+        hideLoginOverlay();
+        showUserBadge();
+        initAppAfterLogin();
+        showToast('👋 Welcome back, ' + currentSalesUser.name, 'info', 2000);
+    } else {
+        showLoginOverlay();
+    }
+
+    // FALLBACK — verify access every 15s (safety net if listener fails)
+    if (fallbackCheckInterval) clearInterval(fallbackCheckInterval);
+    fallbackCheckInterval = setInterval(async () => {
+        if (document.hidden) return;
+        if (!currentSalesUser) return;
+        if (accessRevokedFlag) return;
+
+        try {
+            const snap = await flipkartDb.ref('users/' + currentSalesUser.username).once('value');
+            if (!snap.exists()) {
+                forceLogout('Your account has been removed.');
+                return;
+            }
+            const access = verifySalesAccess(snap.val());
+            if (!access.ok) {
+                let reason = 'Your Sales Management access has been revoked by admin.';
+                if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
+                if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
+                console.log('[SalesManager] 🔒 Fallback check detected revocation:', access.reason);
+                forceLogout(reason);
+            }
+        } catch (e) {
+            console.warn('[SalesManager] Fallback access check failed:', e);
+        }
+    }, 15000);
+
     setInterval(() => {
         if (document.hidden) return;
+        if (!isStillAuthorized()) return;
         if (currentView === 'inventory') loadInventory();
-        else loadReturnsHistory();
+        else if (currentView === 'returns') loadReturnsHistory();
+        loadRecentSalesHistory();
     }, 60000);
 
-    showToast('👋 Sales Manager ready', 'info', 2000);
-    console.log('✅ Sales Manager initialized — brand-aware smart search');
+    console.log('[SalesManager] ✅ v3.2 initialized — revoke listener + 15s fallback');
 });
 
 // ---------- MODAL OUTSIDE-CLICK + ESC ----------
@@ -1519,3 +2236,11 @@ window.clearExchangeSearchInput = clearExchangeSearchInput;
 window.submitReturn = submitReturn;
 window.loadReturnsHistory = loadReturnsHistory;
 window.viewReturnMessage = viewReturnMessage;
+
+window.attemptSalesLogin = attemptSalesLogin;
+window.logoutSalesUser = logoutSalesUser;
+window.loadRecentSalesHistory = loadRecentSalesHistory;
+window.copySaleMessageForHistory = copySaleMessageForHistory;
+
+// Version log for cache verification
+console.log('[SalesManager] ✅ v3.2 loaded — inventory + returns only');
