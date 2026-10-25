@@ -175,6 +175,7 @@ let currentSource = 'flipkart';
 let inventoryList = [];
 let filteredInventory = [];
 let sellOrderData = null;
+let sellOrderContext = null;
 let isRefreshing = false;
 
 // Outside business records state (kept separate from regular inventory)
@@ -459,10 +460,11 @@ function renderDesktopTable() {
 // OUTSIDE BUSINESS RECORDS
 // Flipkart: outside_pickups on the Flipkart database
 // Casify:   outside_pickups on the Cashify database
-// Read-only. Kept completely separate from regular inventory state.
+// The outside_pickups node stays read-only here. Selling updates only the
+// linked pickups/{pickupId} row, never the outside approval record.
 // ================================================================
 function getOutsideSectionLabel(source) {
-    return source === 'cashify' ? 'Casify Outside Inventory' : 'Flipkart Outside Pickups';
+    return source === 'cashify' ? 'Casify Outside Inventory' : 'Flipkart Outside Inventory';
 }
 
 function getOutsidePillLabel(source) {
@@ -470,7 +472,15 @@ function getOutsidePillLabel(source) {
 }
 
 function getOutsideRecordNoun(source) {
-    return source === 'cashify' ? 'Casify outside inventory' : 'Flipkart outside pickup';
+    return source === 'cashify' ? 'Casify outside inventory' : 'Flipkart outside inventory';
+}
+
+function isOutsideMarkedPickup(pickup) {
+    return Boolean(pickup && (
+        pickup.outsidePickup === true
+        || pickup.outsidePickup === 'true'
+        || pickup.outside_pickup === true
+    ));
 }
 
 function formatOutsideDate(value) {
@@ -558,10 +568,11 @@ function getOutsideStatusClass(statusKey) {
     return 'other';
 }
 
-function buildOutsideRecord(key, outsideRecord, pickup, source, orphan) {
+function buildOutsideRecord(key, outsideRecord, pickup, source, orphan, pickupKey) {
     const out = outsideRecord || {};
     const inv = pickup || {};
     const pickupId = String(out.pickupId || out.orderId || inv.orderId || key || '');
+    const linkedPickupKey = pickupKey ? String(pickupKey) : (pickup ? String(key) : '');
     const status = deriveOutsideStatus(outsideRecord, pickup);
     const recordTs = Number(out.createdAt)
         || outsideTimeValue(out.timestamp)
@@ -581,6 +592,8 @@ function buildOutsideRecord(key, outsideRecord, pickup, source, orphan) {
         _key: String(key),
         _source: source,
         _orphan: orphan === true,
+        _pickupKey: linkedPickupKey,
+        _isOutsidePickup: isOutsideMarkedPickup(pickup),
         id: pickupId,
         orderId: pickupId,
         pickupId,
@@ -595,6 +608,10 @@ function buildOutsideRecord(key, outsideRecord, pickup, source, orphan) {
         agent: out.agent || inv.agent || '',
         rider: out.rider || out.agentName || inv.rider || inv.agent || '',
         value: valueRaw,
+        coins: inv.coins,
+        coinValueRate: inv.coinValueRate,
+        coinTotalValue: inv.coinTotalValue,
+        actualTotalCost: inv.actualTotalCost,
         sold: inv.sold === true,
         salePrice: (inv.salePrice !== undefined && inv.salePrice !== null) ? Number(inv.salePrice) : null,
         buyerName: inv.buyerName || '',
@@ -639,20 +656,31 @@ function buildOutsideRecords(outsideData, pickupsData, source) {
     Object.entries(outside).forEach(([key, record]) => {
         if (!record || typeof record !== 'object' || Array.isArray(record)) return;
         const pickupId = String(record.pickupId || record.orderId || key);
-        const pickup = pickups[pickupId] || pickups[key] || null;
+        let pickupKey = '';
+        let pickup = null;
+        if (pickups[pickupId]) {
+            pickup = pickups[pickupId];
+            pickupKey = pickupId;
+        } else if (pickups[key]) {
+            pickup = pickups[key];
+            pickupKey = String(key);
+        }
         claimed.add(String(key));
-        if (pickup) claimed.add(pickupId);
-        records.push(buildOutsideRecord(key, record, pickup, source, false));
+        if (pickup) {
+            claimed.add(pickupKey);
+            claimed.add(pickupId);
+        }
+        records.push(buildOutsideRecord(key, record, pickup, source, false, pickupKey));
     });
 
     // Approved outside pickups are mirrored into pickups with outsidePickup:true.
     // Include any mirrored record that no longer has an outside_pickups entry.
     Object.entries(pickups).forEach(([key, pickup]) => {
-        if (!pickup || typeof pickup !== 'object' || pickup.outsidePickup !== true) return;
+        if (!isOutsideMarkedPickup(pickup)) return;
         if (claimed.has(String(key))) return;
         const orderId = String(pickup.orderId || '');
         if (orderId && claimed.has(orderId)) return;
-        records.push(buildOutsideRecord(key, null, pickup, source, true));
+        records.push(buildOutsideRecord(key, null, pickup, source, true, String(key)));
     });
 
     records.sort((a, b) => {
@@ -660,6 +688,20 @@ function buildOutsideRecords(outsideData, pickupsData, source) {
         return String(a.pickupId).localeCompare(String(b.pickupId));
     });
     return records;
+}
+
+function isOutsideRecordSellable(record) {
+    if (!record) return false;
+    if (record._source !== 'flipkart' && record._source !== 'cashify') return false;
+    if (record.status.key !== 'instock') return false;
+    if (record.sold === true || record.returned === true) return false;
+    if (record.inventoryFound !== true || !record._pickupKey) return false;
+    if (record._isOutsidePickup !== true) return false;
+
+    // Approved outside records must have created their inventory row. Orphan
+    // rows are already outside-marked inventory, so their pickup is the link.
+    if (record._orphan) return true;
+    return record.outsideStatus === 'approved' && record.outsideInventoryCreated === true;
 }
 
 function updateOutsideHeader(source) {
@@ -671,7 +713,7 @@ function updateOutsideHeader(source) {
     if (subEl) {
         subEl.textContent = isCashify
             ? 'Outside inventory records from Casify, separate from regular inventory'
-            : 'Outside pickup records from Flipkart, separate from regular inventory';
+            : 'Outside inventory records from Flipkart, separate from regular inventory';
     }
 
     const banner = document.getElementById('outsideBanner');
@@ -887,6 +929,9 @@ function renderOutsideMobileCards() {
         const customerLine = item.customerName
             ? `<div class="flex items-center gap-1.5"><i data-lucide="user" class="w-3 h-3 flex-shrink-0"></i><span class="truncate">${escapeHtml(item.customerName)}</span></div>`
             : '';
+        const sellButton = isOutsideRecordSellable(item)
+            ? `<button type="button" onclick="openOutsideSellModal('${safeKey}')" class="btn-action success flex-1"><i data-lucide="badge-dollar-sign"></i> Sell</button>`
+            : '';
         html += `
             <div class="inventory-card ${srcClass}">
                 <div class="flex items-start justify-between gap-2 mb-2 pl-2">
@@ -908,6 +953,7 @@ function renderOutsideMobileCards() {
                 </div>
                 <div class="flex gap-2 mt-3 pl-2">
                     <button type="button" onclick="viewOutsideRecord('${safeKey}')" class="btn-action view flex-1"><i data-lucide="eye"></i> View Details</button>
+                    ${sellButton}
                 </div>
             </div>`;
     });
@@ -945,6 +991,9 @@ function renderOutsideDesktopTable() {
         const soldSubline = item.status.key === 'sold' && item.saleDateLabel
             ? `<div class="text-[10px] text-gray-400 mt-0.5">Sold: ${escapeHtml(item.saleDateLabel)}</div>`
             : '';
+        const sellButton = isOutsideRecordSellable(item)
+            ? `<button type="button" onclick="openOutsideSellModal('${safeKey}')" class="btn-action success" style="padding:8px 12px;min-height:38px;" title="Sell this phone"><i data-lucide="badge-dollar-sign" style="width:16px;height:16px;"></i></button>`
+            : '';
         html += `
             <tr class="border-b border-gray-50 hover:bg-gray-50 transition">
                 <td class="py-3 px-4 text-gray-400 font-mono text-xs">${idx + 1}</td>
@@ -961,7 +1010,10 @@ function renderOutsideDesktopTable() {
                 </td>
                 <td class="py-3 px-4 text-gray-700 text-sm font-semibold whitespace-nowrap">${escapeHtml(formatOutsideMoney(item.value))}</td>
                 <td class="py-3 px-4">
-                    <button type="button" onclick="viewOutsideRecord('${safeKey}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View details"><i data-lucide="eye" style="width:16px;height:16px;"></i></button>
+                    <div class="flex items-center gap-2">
+                        <button type="button" onclick="viewOutsideRecord('${safeKey}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View details"><i data-lucide="eye" style="width:16px;height:16px;"></i></button>
+                        ${sellButton}
+                    </div>
                 </td>
             </tr>`;
     });
@@ -978,7 +1030,7 @@ function viewOutsideRecord(key) {
     if (!modal || !content) return;
 
     const titleEl = document.getElementById('detailModalTitle');
-    if (titleEl) titleEl.textContent = 'Outside Pickup Details';
+    if (titleEl) titleEl.textContent = 'Outside Inventory Details';
     modal.style.display = 'flex';
     document.body.style.overflow = 'hidden';
 
@@ -1004,7 +1056,7 @@ function viewOutsideRecord(key) {
     if (record._orphan) {
         noteHtml = `<div class="detail-item full"><div class="label">Note</div><div class="value" style="color:#92400e;font-size:12px;">Shown from outside-marked inventory. No matching outside_pickups record was found.</div></div>`;
     } else if (record.outsideStatus === 'approved' && !record.inventoryFound) {
-        noteHtml = `<div class="detail-item full"><div class="label">Note</div><div class="value" style="color:#92400e;font-size:12px;">Approved outside pickup, but no linked inventory record was found.</div></div>`;
+        noteHtml = `<div class="detail-item full"><div class="label">Note</div><div class="value" style="color:#92400e;font-size:12px;">Approved outside inventory record, but no linked inventory row was found.</div></div>`;
     } else if (record.outsideStatus === 'rejected' && record.rejectReason) {
         noteHtml = `<div class="detail-item full"><div class="label">Rejection Reason</div><div class="value" style="color:#991b1b;font-size:12px;">${escapeHtml(record.rejectReason)}</div></div>`;
     }
@@ -1107,7 +1159,60 @@ function openSellModal(orderId) {
     if (!isStillAuthorized()) { showLoginOverlay(); return; }
     const order = inventoryList.find(item => item.id === orderId);
     if (!order) { showToast('Order not found in inventory', 'error'); return; }
+    openSellModalForOrder(order, {
+        source: currentSource,
+        isOutside: false,
+        outsideKey: null,
+        pickupKey: order.id
+    });
+}
+
+function openOutsideSellModal(key) {
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
+    if (!outsideViewOpen) { showToast('Open an outside inventory section first', 'warning'); return; }
+
+    const record = outsideInventoryList.find(item => item._key === String(key));
+    if (!record) { showToast('Outside record not found', 'error'); return; }
+    if (record._source !== outsideSource) {
+        showToast('Outside record source mismatch. Refresh and try again.', 'error');
+        return;
+    }
+    if (!isOutsideRecordSellable(record)) {
+        showToast('Only In Stock outside inventory phones can be sold.', 'warning');
+        return;
+    }
+
+    const order = Object.assign({}, record, {
+        id: record._pickupKey,
+        orderId: record.pickupId,
+        value: record.value,
+        coins: record.coins,
+        coinValueRate: record.coinValueRate,
+        coinTotalValue: record.coinTotalValue,
+        actualTotalCost: record.actualTotalCost
+    });
+
+    openSellModalForOrder(order, {
+        source: record._source,
+        isOutside: true,
+        outsideKey: record._key,
+        pickupKey: record._pickupKey
+    });
+}
+
+function openSellModalForOrder(order, context) {
+    const source = (context && (context.source === 'cashify' || context.source === 'flipkart'))
+        ? context.source
+        : currentSource;
+    const isOutside = Boolean(context && context.isOutside === true);
+
     sellOrderData = order;
+    sellOrderContext = {
+        source,
+        isOutside,
+        outsideKey: (context && context.outsideKey) ? String(context.outsideKey) : null,
+        pickupKey: (context && context.pickupKey) ? String(context.pickupKey) : String(order.id)
+    };
 
     document.getElementById('sellOrderId').value = order.orderId || order.id;
     document.getElementById('sellModel').value = order.phoneModel || '—';
@@ -1120,12 +1225,13 @@ function openSellModal(orderId) {
 
     const banner = document.getElementById('sellSourceBanner');
     if (banner) {
-        if (currentSource === 'cashify') {
+        const outsideSuffix = isOutside ? ' Outside Inventory' : '';
+        if (source === 'cashify') {
             banner.style.background = '#E6FAF6'; banner.style.color = '#0FA88B'; banner.style.border = '1px solid #a7f3d0';
-            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#12CAA7;display:inline-block;"></span>Selling from Cashify</span><span>CASHIFY</span>`;
+            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#12CAA7;display:inline-block;"></span>Selling from Cashify${outsideSuffix}</span><span>CASHIFY</span>`;
         } else {
             banner.style.background = '#eef2ff'; banner.style.color = '#4338ca'; banner.style.border = '1px solid #c7d2fe';
-            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#6366f1;display:inline-block;"></span>Selling from Flipkart</span><span>FLIPKART</span>`;
+            banner.innerHTML = `<span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:#6366f1;display:inline-block;"></span>Selling from Flipkart${outsideSuffix}</span><span>FLIPKART</span>`;
         }
     }
 
@@ -1141,6 +1247,7 @@ function closeSellModal() {
     if (modal) modal.style.display = 'none';
     document.body.style.overflow = '';
     sellOrderData = null;
+    sellOrderContext = null;
 }
 
 async function confirmSell() {
@@ -1156,21 +1263,31 @@ async function confirmSell() {
     if (!buyerName) { showToast('Please enter buyer name', 'error'); document.getElementById('sellBuyerName').focus(); return; }
 
     const order = sellOrderData;
-    const source = currentSource;
+    const context = sellOrderContext || {
+        source: currentSource,
+        isOutside: false,
+        outsideKey: null,
+        pickupKey: order.id
+    };
+    const source = context.source;
+    const isOutside = context.isOutside === true;
     const sourceLabel = getSourceLabel(source);
+    const inventoryLabel = isOutside ? sourceLabel + ' Outside Inventory' : sourceLabel;
+    const confirmBadge = sourceLabel.toUpperCase() + (isOutside ? ' OUTSIDE' : '');
 
     const confirm = await Swal.fire({
         title: 'Confirm Sale',
         html: `
             <div style="text-align:left;font-size:14px;line-height:1.7;">
                 <div style="margin-bottom:6px;">
-                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()}</span>
+                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${confirmBadge}</span>
                 </div>
                 <p><strong>Order:</strong> ${escapeHtml(order.orderId || order.id)}</p>
                 <p><strong>Model:</strong> ${escapeHtml(order.phoneModel || '—')}</p>
                 <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
                 <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
                 <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
+                ${isOutside ? `<p><strong>Inventory:</strong> ${escapeHtml(inventoryLabel)}</p>` : ''}
                 <p style="margin-top:6px;font-size:12px;color:#64748b;">🧑‍💼 Recording as: <strong>${escapeHtml(currentSalesUser.name)}</strong> (${escapeHtml(currentSalesUser.username)})</p>
             </div>`,
         icon: 'question',
@@ -1199,7 +1316,8 @@ async function confirmSell() {
         };
 
         if (source === 'flipkart') {
-            const commission = calculateCommission(purchase);
+            // Outside Inventory is commission-free by the existing business rule.
+            const commission = isOutside ? 0 : calculateCommission(purchase);
             const grossProfit = salePrice - purchase - commission;
             const finalProfit = grossProfit - overhead;
             writePayload.commission = commission;
@@ -1217,13 +1335,53 @@ async function confirmSell() {
             writePayload.finalNetProfit = finalProfit;
         }
 
-        await getDb(source).ref('pickups/' + order.id).update(writePayload);
+        if (isOutside) {
+            const pickupKey = String(context.pickupKey || '');
+            if (!pickupKey) throw new Error('Missing linked outside inventory record');
+
+            // Atomic guard: only the still-unsold linked outside pickup can be
+            // updated. A second sale, a returned row, or a regular pickup is
+            // rejected even if this modal was opened from stale list data.
+            const pickupRef = getDb(source).ref('pickups/' + pickupKey);
+            const tx = await pickupRef.transaction(current => {
+                if (!current || typeof current !== 'object') return;
+                if (current.sold === true || current.returned === true) return;
+                if (String(current.status || '').toLowerCase() !== 'pickup') return;
+                if (!isOutsideMarkedPickup(current)) return;
+                return Object.assign({}, current, writePayload);
+            });
+
+            if (!tx.committed) {
+                closeSellModal();
+                const snap = tx.snapshot ? tx.snapshot.val() : null;
+                if (!snap) {
+                    showToast('This outside inventory phone no longer exists. Refresh the list.', 'error');
+                } else if (snap.sold === true) {
+                    showToast('Already sold — this outside phone was sold by someone else. Refreshing…', 'error');
+                } else if (snap.returned === true) {
+                    showToast('This outside phone is marked returned and cannot be sold.', 'error');
+                } else if (String(snap.status || '').toLowerCase() !== 'pickup') {
+                    showToast(`Cannot sell an outside phone in "${snap.status || 'unknown'}" status.`, 'error');
+                } else {
+                    showToast('This phone is no longer outside inventory. Refresh the list.', 'error');
+                }
+                if (outsideViewOpen && outsideSource === source) await loadOutsideInventory();
+                return;
+            }
+        } else {
+            await getDb(source).ref('pickups/' + order.id).update(writePayload);
+        }
 
         allSoldPhonesBoth = [];
         allExchangeInventoryBoth = [];
         returnsDataLoaded = false;
 
-        await loadInventory();
+        if (isOutside) {
+            if (currentSource === source) await loadInventory();
+            if (outsideViewOpen && outsideSource === source) await loadOutsideInventory();
+        } else {
+            await loadInventory();
+        }
         await loadRecentSalesHistory();
 
         closeSellModal();
@@ -1235,7 +1393,7 @@ async function confirmSell() {
         const message = buildSaleMessage(mergedItem, salePrice, source, stockCount);
         await showSaleSuccessModal(message);
 
-        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
+        showToast(`✅ Sold from ${inventoryLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
     } catch (e) {
         console.error('Sale error:', e);
         showToast('Error saving sale. Please try again.', 'error');
@@ -2829,6 +2987,7 @@ window.closeOutsideInventory = closeOutsideInventory;
 window.handleOutsideSearchInput = handleOutsideSearchInput;
 window.clearOutsideSearch = clearOutsideSearch;
 window.viewOutsideRecord = viewOutsideRecord;
+window.openOutsideSellModal = openOutsideSellModal;
 window.loadOutsideInventory = loadOutsideInventory;
 
 window.handleReturnSearchInput = handleReturnSearchInput;
