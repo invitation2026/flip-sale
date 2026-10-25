@@ -38,6 +38,25 @@ const cashifyDb = cashifyApp.database();
 function getDb(source) { return source === 'cashify' ? cashifyDb : flipkartDb; }
 function getSourceLabel(source) { return source === 'cashify' ? 'Cashify' : 'Flipkart'; }
 
+// A record on hold is never a valid pickup or a completed sale. Keep this
+// rule in one place so every count, list and calculation uses it.
+function normalizedPickupStatus(item) {
+    return String((item && item.status) || '').trim().toLowerCase();
+}
+function isOnHold(item) {
+    return normalizedPickupStatus(item) === 'on_hold';
+}
+function isActivePickup(item) {
+    return Boolean(item) && !isOnHold(item) && normalizedPickupStatus(item) === 'pickup' && !item.sold;
+}
+function isCompletedSale(item) {
+    return Boolean(item)
+        && !isOnHold(item)
+        && normalizedPickupStatus(item) === 'pickup'
+        && item.sold === true
+        && item.returned !== true;
+}
+
 const COMMISSION_BRACKETS = [
     { min: 0, max: 10000, type: 'percentage', value: 10 },
     { min: 10001, max: 31000, type: 'percentage', value: 8 },
@@ -310,7 +329,7 @@ async function loadInventory() {
         const snap = await db.ref('pickups').once('value');
         const data = snap.val() || {};
         inventoryList = Object.entries(data)
-            .filter(([_, item]) => item.status === 'pickup' && !item.sold)
+            .filter(([_, item]) => isActivePickup(item))
             .map(([id, item]) => ({ id, ...item, _source: currentSource }));
         inventoryList.sort((a, b) => {
             const ta = new Date(a.timestamp || 0).getTime() || 0;
@@ -339,10 +358,14 @@ function updateStats(pickupsData) {
         return;
     }
     let soldCount = 0;
-    Object.values(pickupsData).forEach(item => { if (item.sold === true) soldCount++; });
+    let activeInventoryCount = 0;
+    Object.values(pickupsData || {}).forEach(item => {
+        if (isCompletedSale(item)) soldCount++;
+        else if (isActivePickup(item)) activeInventoryCount++;
+    });
     const elInv = document.getElementById('statInventory');
     const elSold = document.getElementById('statSold');
-    if (elInv) elInv.textContent = inventoryList.length;
+    if (elInv) elInv.textContent = activeInventoryCount;
     if (elSold) elSold.textContent = soldCount;
 }
 
@@ -540,16 +563,18 @@ function formatOutsideRawStatus(value) {
 
 function deriveOutsideStatus(outsideRecord, pickup) {
     if (pickup) {
+        // Status wins over the sold flag: a held record is never a sale.
+        if (isOnHold(pickup)) return { key: 'on_hold', label: 'On Hold' };
         if (pickup.returned === true && pickup.sold !== true) return { key: 'returned', label: 'Returned' };
         if (pickup.sold === true) return { key: 'sold', label: 'Sold' };
-        const pickupStatus = String(pickup.status || '').toLowerCase();
+        const pickupStatus = normalizedPickupStatus(pickup);
         if (pickupStatus === 'pickup') return { key: 'instock', label: 'In Stock' };
-        if (pickupStatus === 'on_hold') return { key: 'pending', label: 'On Hold' };
         if (pickupStatus === 'rejected') return { key: 'rejected', label: 'Rejected' };
         return { key: 'other', label: formatOutsideRawStatus(pickupStatus) };
     }
 
     const outsideStatus = String((outsideRecord && outsideRecord.status) || '').toLowerCase();
+    if (outsideStatus === 'on_hold') return { key: 'on_hold', label: 'On Hold' };
     if (outsideStatus === 'approved' || (outsideRecord && outsideRecord.inventoryCreated === true)) {
         return { key: 'approved', label: 'Approved' };
     }
@@ -562,6 +587,7 @@ function getOutsideStatusClass(statusKey) {
     if (statusKey === 'instock') return 'available';
     if (statusKey === 'sold') return 'sold';
     if (statusKey === 'pending') return 'pending';
+    if (statusKey === 'on_hold') return 'pending';
     if (statusKey === 'rejected') return 'rejected';
     if (statusKey === 'returned') return 'returned';
     if (statusKey === 'approved') return 'approved';
@@ -574,6 +600,7 @@ function buildOutsideRecord(key, outsideRecord, pickup, source, orphan, pickupKe
     const pickupId = String(out.pickupId || out.orderId || inv.orderId || key || '');
     const linkedPickupKey = pickupKey ? String(pickupKey) : (pickup ? String(key) : '');
     const status = deriveOutsideStatus(outsideRecord, pickup);
+    const onHold = isOnHold(inv);
     const recordTs = Number(out.createdAt)
         || outsideTimeValue(out.timestamp)
         || Number(out.approvedAt)
@@ -612,14 +639,14 @@ function buildOutsideRecord(key, outsideRecord, pickup, source, orphan, pickupKe
         coinValueRate: inv.coinValueRate,
         coinTotalValue: inv.coinTotalValue,
         actualTotalCost: inv.actualTotalCost,
-        sold: inv.sold === true,
-        salePrice: (inv.salePrice !== undefined && inv.salePrice !== null) ? Number(inv.salePrice) : null,
-        buyerName: inv.buyerName || '',
-        buyerContact: inv.buyerContact || '',
-        saleDate: inv.saleDate || '',
-        saleTimestamp: inv.saleTimestamp || '',
-        soldByName: inv.salesByName || inv.salesBy || '',
-        returned: inv.returned === true,
+        sold: !onHold && inv.sold === true,
+        salePrice: (!onHold && inv.salePrice !== undefined && inv.salePrice !== null) ? Number(inv.salePrice) : null,
+        buyerName: onHold ? '' : (inv.buyerName || ''),
+        buyerContact: onHold ? '' : (inv.buyerContact || ''),
+        saleDate: onHold ? '' : (inv.saleDate || ''),
+        saleTimestamp: onHold ? '' : (inv.saleTimestamp || ''),
+        soldByName: onHold ? '' : (inv.salesByName || inv.salesBy || ''),
+        returned: !onHold && inv.returned === true,
         pickupStatus: inv.status || '',
         outsideStatus: String(out.status || '').toLowerCase(),
         outsideInventoryCreated: out.inventoryCreated === true,
@@ -629,7 +656,7 @@ function buildOutsideRecord(key, outsideRecord, pickup, source, orphan, pickupKe
         status,
         recordTs,
         dateLabel: formatOutsideDate(recordTs || out.date || inv.date),
-        saleDateLabel: inv.sold === true ? formatOutsideDate(inv.saleDate || inv.saleTimestamp) : '',
+        saleDateLabel: (!onHold && inv.sold === true) ? formatOutsideDate(inv.saleDate || inv.saleTimestamp) : '',
         inventoryFound: !!pickup
     };
 
@@ -693,6 +720,7 @@ function buildOutsideRecords(outsideData, pickupsData, source) {
 function isOutsideRecordSellable(record) {
     if (!record) return false;
     if (record._source !== 'flipkart' && record._source !== 'cashify') return false;
+    if (isOnHold({ status: record.pickupStatus })) return false;
     if (record.status.key !== 'instock') return false;
     if (record.sold === true || record.returned === true) return false;
     if (record.inventoryFound !== true || !record._pickupKey) return false;
@@ -840,7 +868,9 @@ async function loadOutsideInventory() {
 }
 
 function updateOutsideStats(list) {
-    const countBy = (key) => list.filter(item => item.status.key === key).length;
+    // Held records are shown as "On Hold" but are excluded from every stat.
+    const countable = list.filter(item => item && item.status && item.status.key !== 'on_hold');
+    const countBy = (key) => countable.filter(item => item.status.key === key).length;
     const inStockEl = document.getElementById('outsideStatInStock');
     const soldEl = document.getElementById('outsideStatSold');
     const pendingEl = document.getElementById('outsideStatPending');
@@ -1042,7 +1072,7 @@ function viewOutsideRecord(key) {
     const approvedLabel = record.approvedAt ? formatOutsideDateTime(record.approvedAt) : '—';
 
     let saleHtml = '';
-    if (record.sold) {
+    if (record.sold && !isOnHold({ status: record.pickupStatus })) {
         saleHtml = `
             <div class="detail-item"><div class="label">Sale Price</div><div class="value">${escapeHtml(formatOutsideMoney(record.salePrice))}</div></div>
             <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(record.buyerName || '—')}</div></div>
@@ -1126,18 +1156,19 @@ async function computeOverheadPerPhone(source) {
     let totalPickupIncentives = 0;
     let totalRejectIncentives = 0;
     Object.values(pickups).forEach(item => {
-        if (!item || item.status === 'on_hold') return;
+        if (!item || isOnHold(item)) return;
         const agent = item.agent;
         if (!agent) return;
         const uData = users[agent];
         if (!uData || (uData.role || 'agent') !== 'agent') return;
-        if (item.status === 'pickup') totalPickupIncentives += Number(uData.pickup_incentive) || 0;
-        else if (item.status === 'rejected' && Boolean(item.incentive_approved)) totalRejectIncentives += Number(uData.reject_incentive) || 0;
+        const status = normalizedPickupStatus(item);
+        if (status === 'pickup') totalPickupIncentives += Number(uData.pickup_incentive) || 0;
+        else if (status === 'rejected' && Boolean(item.incentive_approved)) totalRejectIncentives += Number(uData.reject_incentive) || 0;
     });
     totalOverhead += totalPickupIncentives + totalRejectIncentives;
 
     let totalSold = 0;
-    Object.values(pickups).forEach(item => { if (item && item.status === 'pickup' && item.sold) totalSold++; });
+    Object.values(pickups).forEach(item => { if (isCompletedSale(item)) totalSold++; });
     return totalSold > 0 ? totalOverhead / totalSold : 0;
 }
 
@@ -1369,7 +1400,35 @@ async function confirmSell() {
                 return;
             }
         } else {
-            await getDb(source).ref('pickups/' + order.id).update(writePayload);
+            const pickupKey = String(context.pickupKey || order.id || '');
+            if (!pickupKey) throw new Error('Missing inventory record key');
+
+            // Atomic guard: a phone can only be sold while it is still an
+            // unsold pickup. Held/returned/rejected rows must never be turned
+            // into a completed sale from a stale modal.
+            const pickupRef = getDb(source).ref('pickups/' + pickupKey);
+            const tx = await pickupRef.transaction(current => {
+                if (!current || typeof current !== 'object') return;
+                if (current.sold === true || current.returned === true) return;
+                if (String(current.status || '').trim().toLowerCase() !== 'pickup') return;
+                return Object.assign({}, current, writePayload);
+            });
+
+            if (!tx.committed) {
+                closeSellModal();
+                const snap = tx.snapshot ? tx.snapshot.val() : null;
+                if (!snap) {
+                    showToast('This phone no longer exists. Refresh the list.', 'error');
+                } else if (snap.sold === true) {
+                    showToast('Already sold — this phone was sold by someone else. Refreshing…', 'error');
+                } else if (snap.returned === true) {
+                    showToast('This phone is marked returned and cannot be sold.', 'error');
+                } else {
+                    showToast(`Cannot sell a phone in "${snap.status || 'unknown'}" status.`, 'error');
+                }
+                await loadInventory();
+                return;
+            }
         }
 
         allSoldPhonesBoth = [];
@@ -1424,11 +1483,13 @@ async function viewOrderDetail(orderId, sourceOverride) {
         const item = snap.val();
         if (!item) { content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium">Order not found</p></div>`; refreshIcons(); return; }
 
-        const statusLabel = item.status || 'unknown';
-        const isSold = item.sold === true;
-        const isReturned = item.returned === true;
+        const statusLabel = normalizedPickupStatus(item) || 'unknown';
+        const onHold = isOnHold(item);
+        const isSold = !onHold && item.sold === true;
+        const isReturned = !onHold && item.returned === true;
         let statusDisplay, statusClass;
-        if (isReturned && !isSold) { statusDisplay = 'Returned'; statusClass = 'sold'; }
+        if (onHold) { statusDisplay = 'On Hold'; statusClass = 'pending'; }
+        else if (isReturned && !isSold) { statusDisplay = 'Returned'; statusClass = 'sold'; }
         else if (isSold) { statusDisplay = 'Sold'; statusClass = 'sold'; }
         else if (statusLabel === 'pickup') { statusDisplay = 'Pickup'; statusClass = 'available'; }
         else if (statusLabel === 'rejected') { statusDisplay = 'Rejected'; statusClass = 'rejected'; }
@@ -1438,7 +1499,7 @@ async function viewOrderDetail(orderId, sourceOverride) {
         const pillClass = source === 'cashify' ? 'cashify' : 'flipkart';
 
         let saleHtml = '';
-        if (isSold || isReturned) {
+        if (!onHold && (isSold || isReturned)) {
             saleHtml = `
                 <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${Number(item.salePrice || item.lastSalePrice || 0).toLocaleString('en-IN')}</div></div>
                 <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(item.buyerName || item.lastBuyerName || '—')}</div></div>
@@ -1530,14 +1591,12 @@ async function refreshSoldPhonesCache() {
     ]);
     const fk = fkSnap.val() || {};
     const cf = cfSnap.val() || {};
-    const isSoldNotReturned = (item) =>
-        item && item.status === 'pickup' && item.sold === true && item.returned !== true;
 
     const fkSold = Object.entries(fk)
-        .filter(([_, item]) => isSoldNotReturned(item))
+        .filter(([_, item]) => isCompletedSale(item))
         .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'flipkart' }));
     const cfSold = Object.entries(cf)
-        .filter(([_, item]) => isSoldNotReturned(item))
+        .filter(([_, item]) => isCompletedSale(item))
         .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'cashify' }));
 
     allSoldPhonesBoth = [...fkSold, ...cfSold].sort((a, b) => {
@@ -1555,7 +1614,7 @@ async function loadReturnsInventoryCounts() {
         ]);
         const countUnsold = (data) => {
             let n = 0;
-            Object.values(data || {}).forEach(item => { if (item && item.status === 'pickup' && !item.sold) n++; });
+            Object.values(data || {}).forEach(item => { if (isActivePickup(item)) n++; });
             return n;
         };
         const fkEl = document.getElementById('flipkartInvCount');
@@ -1787,7 +1846,7 @@ async function loadExchangeInventoryBoth() {
     ]);
     const fk = fkSnap.val() || {};
     const cf = cfSnap.val() || {};
-    const isAvailable = (item) => item && item.status === 'pickup' && !item.sold;
+    const isAvailable = (item) => isActivePickup(item);
 
     const fkAvail = Object.entries(fk)
         .filter(([_, item]) => isAvailable(item))
@@ -1958,10 +2017,20 @@ async function submitReturn() {
         const originalDb = getDb(originalSource);
         const freshSnap = await originalDb.ref('pickups/' + original.id).once('value');
         const fresh = freshSnap.val();
-        if (!fresh || fresh.sold !== true || fresh.returned === true) {
+        if (!isCompletedSale(fresh)) {
             showToast('This phone is no longer eligible for return', 'error');
             if (btn) { btn.disabled = false; btn.innerHTML = originalBtnHtml; refreshIcons(); }
             return;
+        }
+
+        if (type === 'exchange' && exchangePhone) {
+            const exchangeFreshSnap = await getDb(exchangePhone._source)
+                .ref('pickups/' + exchangePhone.id).once('value');
+            if (!isActivePickup(exchangeFreshSnap.val())) {
+                showToast('Selected exchange phone is no longer available', 'error');
+                if (btn) { btn.disabled = false; btn.innerHTML = originalBtnHtml; refreshIcons(); }
+                return;
+            }
         }
 
         const returnId = 'ret_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
@@ -1975,6 +2044,12 @@ async function submitReturn() {
             originalSalePrice,
             originalSaleDate: original.saleDate || (original.saleTimestamp ? getLocalYMD(new Date(original.saleTimestamp)) : '—'),
             originalBuyerName: original.buyerName || '',
+            ...(type === 'exchange' ? {
+                originalBuyerContact: original.buyerContact || '',
+                originalRam: original.ram || '',
+                originalStorage: original.storage || '',
+                originalRamStorage: original.ramStorage || ''
+            } : {}),
             returnDate,
             returnType: type,
             returnAmount: type === 'money' ? returnAmount : 0,
@@ -2033,7 +2108,7 @@ async function submitReturn() {
         ]);
         const countUnsold = (data) => {
             let n = 0;
-            Object.values(data || {}).forEach(item => { if (item && item.status === 'pickup' && !item.sold) n++; });
+            Object.values(data || {}).forEach(item => { if (isActivePickup(item)) n++; });
             return n;
         };
         const fkCount = countUnsold(fkSnap2.val());
@@ -2075,6 +2150,20 @@ function buildReturnMessage(r) {
     L.push('');
     L.push(`📋 Order ID: ${r.originalOrderId}`);
     L.push(`📱 Model: ${r.originalModel}`);
+    if (r.returnType === 'exchange') {
+        const notRecorded = 'Not recorded';
+        const imei = String(r.originalImei || '').trim() || notRecorded;
+        const ramStorage = String(r.originalRamStorage || '').trim()
+            || ((r.originalRam || r.originalStorage)
+                ? `${r.originalRam || '—'} / ${r.originalStorage || '—'}`
+                : notRecorded);
+        const buyerName = String(r.originalBuyerName || '').trim() || notRecorded;
+        const buyerContact = String(r.originalBuyerContact || '').trim() || notRecorded;
+        L.push(`🔖 IMEI: ${imei}`);
+        L.push(`💾 RAM/ROM: ${ramStorage}`);
+        L.push(`👤 Buyer: ${buyerName}`);
+        L.push(`📞 Buyer Contact: ${buyerContact}`);
+    }
     L.push(`💰 Sale Amount: ₹${(Number(r.originalSalePrice) || 0).toLocaleString('en-IN')}`);
     L.push(`📅 Sale Date: ${r.originalSaleDate}`);
     L.push('');
@@ -2703,7 +2792,7 @@ async function getSourceInventoryCount(source) {
     const data = snap.val() || {};
     let count = 0;
     Object.values(data).forEach(item => {
-        if (item && item.status === 'pickup' && !item.sold) count++;
+        if (isActivePickup(item)) count++;
     });
     return count;
 }
@@ -2807,7 +2896,7 @@ async function loadRecentSalesHistory() {
         const fk = fkSnap.val() || {};
         const cf = cfSnap.val() || {};
 
-        const isSold = (item) => item && item.sold === true && item.status === 'pickup';
+        const isSold = (item) => isCompletedSale(item);
 
         const fkSold = Object.entries(fk)
             .filter(([_, item]) => isSold(item))
@@ -2888,6 +2977,10 @@ async function copySaleMessageForHistory(source, id) {
         const item = snap.val();
         if (!item) {
             showToast('Sale not found', 'error');
+            return;
+        }
+        if (!isCompletedSale(item)) {
+            showToast('This record is not a completed sale', 'error');
             return;
         }
         let count = 0;
