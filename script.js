@@ -1,10 +1,16 @@
-// ================================================================
+﻿// ================================================================
 // Sales Manager · Flipkart + Cashify
-// Dual Firebase · Returns Smart Search (brand-aware, multi-token)
-// + Sales Management Login & Access Control
-// + Sale WhatsApp Message & Recent History
-// + Immediate Revoke Logout (with fallback)
-// v3.2 — Activity view removed
+// v4.1 — Reliable + Instant Sale + Flipkart/Outside Inventory Breakdown
+// ----------------------------------------------------------------
+// ✔ Instant sale flow (write-first, UI-first, background sync)
+// ✔ In-memory SWR cache for pickups / users / attendance
+// ✔ localStorage snapshot → instant paint on page reload
+// ✔ Optimistic session restore (no login-screen flicker)
+// ✔ Network-fault tolerant access checks (no false logouts)
+// ✔ Overhead computed from cache (no blocking network reads)
+// ✔ Request de-duplication + timeouts + graceful degradation
+// ✔ Returns / exchange flow optimised (no redundant reads)
+// ✔ WhatsApp sale message: Flipkart vs Outside Inventory breakdown
 // ================================================================
 
 // ---------- FIREBASE ----------
@@ -37,6 +43,20 @@ const cashifyDb = cashifyApp.database();
 // ---------- HELPERS ----------
 function getDb(source) { return source === 'cashify' ? cashifyDb : flipkartDb; }
 function getSourceLabel(source) { return source === 'cashify' ? 'Cashify' : 'Flipkart'; }
+function hasSwal() { return typeof Swal !== 'undefined' && Swal && typeof Swal.fire === 'function'; }
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function withTimeout(promise, ms, fallbackValue) {
+    return Promise.race([
+        Promise.resolve(promise),
+        new Promise((resolve, reject) => {
+            setTimeout(() => {
+                if (arguments.length >= 3) resolve(fallbackValue);
+                else reject(new Error('timeout'));
+            }, ms);
+        })
+    ]);
+}
 
 const COMMISSION_BRACKETS = [
     { min: 0, max: 10000, type: 'percentage', value: 10 },
@@ -65,49 +85,94 @@ function escapeHtml(s) {
 function formatTimeShort(d = new Date()) {
     return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
 }
-function refreshIcons() { if (window.lucide) { try { lucide.createIcons(); } catch (e) {} } }
+
+/**
+ * Detect if a pickup record is an "Outside Pickup" (approved from outside_pickups
+ * in the Flipkart Admin Panel). Mirrors the admin panel's isOutsidePickupItem
+ * so both apps agree on which phones belong to "Outside Inventory".
+ */
+function isOutsidePickupItem(item) {
+    if (!item || typeof item !== 'object') return false;
+    const trueValue = v => v === true || String(v).toLowerCase() === 'true';
+    if (trueValue(item.outsidePickup) || trueValue(item.isOutsidePickup) || trueValue(item.outside_pickup)) return true;
+    if (item.approvedFromOutsidePickupAt !== undefined && item.approvedFromOutsidePickupAt !== null) return true;
+    const src = String(item.source || item.pickupSource || item.pickupType || item.orderType || '').toLowerCase();
+    return ['outside', 'outside_pickup', 'outside_pickups'].includes(src);
+}
+
+/**
+ * Count unsold Flipkart-source inventory split into:
+ *   • flipkart → regular order pickups (status = pickup, not sold, not outside)
+ *   • outside  → outside pickups approved into inventory
+ * Returns { flipkart, outside, total }.
+ */
+function getFlipkartInventoryBreakdown(data) {
+    let flipkart = 0;
+    let outside = 0;
+    if (data) {
+        for (const id in data) {
+            const it = data[id];
+            if (!it || it.status !== 'pickup' || it.sold) continue;
+            if (isOutsidePickupItem(it)) outside++;
+            else flipkart++;
+        }
+    }
+    return { flipkart, outside, total: flipkart + outside };
+}
+
+let _iconTimer = null;
+function refreshIcons() {
+    if (_iconTimer) clearTimeout(_iconTimer);
+    _iconTimer = setTimeout(() => {
+        _iconTimer = null;
+        if (window.lucide) { try { lucide.createIcons(); } catch (e) {} }
+    }, 16);
+}
+function refreshIconsNow() {
+    if (window.lucide) { try { lucide.createIcons(); } catch (e) {} }
+}
 
 // ================================================================
 // SMART SEARCH ENGINE — brand-aware, multi-token
 // ================================================================
 const BRAND_ALIASES = {
-    'apple':    ['apple', 'iphone'],
-    'iphone':   ['iphone', 'apple'],
-    'samsung':  ['samsung', 'galaxy'],
-    'galaxy':   ['galaxy', 'samsung'],
-    'xiaomi':   ['xiaomi', 'redmi', 'poco', 'mi'],
-    'redmi':    ['redmi', 'xiaomi', 'mi'],
-    'poco':     ['poco', 'xiaomi', 'redmi'],
-    'mi':       ['mi', 'xiaomi', 'redmi', 'poco'],
-    'google':   ['google', 'pixel'],
-    'pixel':    ['pixel', 'google'],
+    'apple': ['apple', 'iphone'],
+    'iphone': ['iphone', 'apple'],
+    'samsung': ['samsung', 'galaxy'],
+    'galaxy': ['galaxy', 'samsung'],
+    'xiaomi': ['xiaomi', 'redmi', 'poco', 'mi'],
+    'redmi': ['redmi', 'xiaomi', 'mi'],
+    'poco': ['poco', 'xiaomi', 'redmi'],
+    'mi': ['mi', 'xiaomi', 'redmi', 'poco'],
+    'google': ['google', 'pixel'],
+    'pixel': ['pixel', 'google'],
     'motorola': ['motorola', 'moto'],
-    'moto':     ['moto', 'motorola'],
-    'vivo':     ['vivo', 'iqoo'],
-    'iqoo':     ['iqoo', 'vivo'],
-    'sony':     ['sony', 'xperia'],
-    'xperia':   ['xperia', 'sony'],
-    'asus':     ['asus', 'zenfone', 'rog'],
-    'zenfone':  ['zenfone', 'asus'],
-    'rog':      ['rog', 'asus'],
-    'huawei':   ['huawei', 'honor'],
-    'honor':    ['honor', 'huawei'],
-    'oneplus':  ['oneplus'],
-    'realme':   ['realme'],
-    'oppo':     ['oppo'],
-    'nokia':    ['nokia'],
-    'nothing':  ['nothing'],
-    'infinix':  ['infinix'],
-    'tecno':    ['tecno'],
-    'itel':     ['itel'],
-    'lava':     ['lava'],
+    'moto': ['moto', 'motorola'],
+    'vivo': ['vivo', 'iqoo'],
+    'iqoo': ['iqoo', 'vivo'],
+    'sony': ['sony', 'xperia'],
+    'xperia': ['xperia', 'sony'],
+    'asus': ['asus', 'zenfone', 'rog'],
+    'zenfone': ['zenfone', 'asus'],
+    'rog': ['rog', 'asus'],
+    'huawei': ['huawei', 'honor'],
+    'honor': ['honor', 'huawei'],
+    'oneplus': ['oneplus'],
+    'realme': ['realme'],
+    'oppo': ['oppo'],
+    'nokia': ['nokia'],
+    'nothing': ['nothing'],
+    'infinix': ['infinix'],
+    'tecno': ['tecno'],
+    'itel': ['itel'],
+    'lava': ['lava'],
     'micromax': ['micromax'],
-    'lenovo':   ['lenovo'],
-    'lg':       ['lg'],
-    'htc':      ['htc'],
+    'lenovo': ['lenovo'],
+    'lg': ['lg'],
+    'htc': ['htc'],
     'blackberry': ['blackberry'],
     'panasonic': ['panasonic'],
-    'alcatel':  ['alcatel'],
+    'alcatel': ['alcatel'],
 };
 
 function normalizeSearchText(str) {
@@ -176,18 +241,18 @@ let inventoryList = [];
 let filteredInventory = [];
 let sellOrderData = null;
 let isRefreshing = false;
+let isSelling = false;
 
 // Sales manager auth state
 let currentSalesUser = null;
 const SALES_AUTH_KEY = 'sales_manager_user';
+let lastAccessVerifiedAt = 0;
 
 // Access listener — immediate revoke detection
 let accessRevokedFlag = false;
 let accessListenerRef = null;
 let fallbackCheckInterval = null;
 
-const overheadCache = { flipkart: { ts: 0, value: 0 }, cashify: { ts: 0, value: 0 } };
-const OVERHEAD_TTL = 10 * 60 * 1000;
 const lastUpdatedBySource = { flipkart: null, cashify: null };
 
 // Returns state
@@ -216,7 +281,242 @@ function showToast(msg, type = 'info', duration = 3000) {
     toastEl._timer = setTimeout(() => toastEl.classList.remove('show'), duration);
 }
 
-// ---------- CONNECTION ----------
+// ================================================================
+// DATA LAYER — SWR CACHE (performance core)
+// ================================================================
+const PICKUPS_TTL = 25 * 1000;
+const META_TTL = 5 * 60 * 1000;
+const OVERHEAD_TTL = 10 * 60 * 1000;
+const LS_INV_PREFIX = 'sm_inv_cache_v2_';
+const LS_OVERHEAD_KEY = 'sm_overhead_v2';
+
+const pickupsCache = {
+    flipkart: { data: null, ts: 0, inflight: null },
+    cashify: { data: null, ts: 0, inflight: null }
+};
+const metaCache = {
+    flipkart: { users: null, usersTs: 0, attendance: null, attTs: 0, usersInflight: null, attInflight: null },
+    cashify: { users: null, usersTs: 0, attendance: null, attTs: 0, usersInflight: null, attInflight: null }
+};
+const overheadCache = { flipkart: { ts: 0, value: 0 }, cashify: { ts: 0, value: 0 } };
+
+function hydrateInventoryFromLS() {
+    ['flipkart', 'cashify'].forEach(src => {
+        try {
+            const raw = localStorage.getItem(LS_INV_PREFIX + src);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.data && typeof parsed.data === 'object') {
+                pickupsCache[src].data = parsed.data;
+                pickupsCache[src].ts = 0;
+            }
+        } catch (_) {}
+    });
+}
+
+function persistInventoryToLS(source, data) {
+    try {
+        const raw = JSON.stringify({ ts: Date.now(), data });
+        if (raw.length > 2.5 * 1024 * 1024) return;
+        localStorage.setItem(LS_INV_PREFIX + source, raw);
+    } catch (_) {}
+}
+
+function hydrateOverheadFromLS() {
+    try {
+        const raw = localStorage.getItem(LS_OVERHEAD_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (!parsed) return;
+        ['flipkart', 'cashify'].forEach(src => {
+            if (parsed[src] && typeof parsed[src].value === 'number') {
+                overheadCache[src] = { ts: parsed[src].ts || 0, value: parsed[src].value || 0 };
+            }
+        });
+    } catch (_) {}
+}
+
+function persistOverheadToLS() {
+    try { localStorage.setItem(LS_OVERHEAD_KEY, JSON.stringify(overheadCache)); } catch (_) {}
+}
+
+function fetchPickups(source) {
+    const c = pickupsCache[source];
+    if (c.inflight) return c.inflight;
+    const p = getDb(source).ref('pickups').once('value').then(snap => {
+        const data = snap.val() || {};
+        c.data = data;
+        c.ts = Date.now();
+        persistInventoryToLS(source, data);
+        return data;
+    }).catch(err => {
+        if (c.data) return c.data;
+        throw err;
+    }).then(res => { c.inflight = null; return res; },
+        err => { c.inflight = null; throw err; });
+    c.inflight = p;
+    return p;
+}
+
+async function getPickups(source, force = false) {
+    const c = pickupsCache[source];
+    const isFresh = c.data && (Date.now() - c.ts) < PICKUPS_TTL;
+    if (!force && isFresh) return c.data;
+    if (!force && c.data) {
+        fetchPickups(source).catch(() => {});
+        return c.data;
+    }
+    return fetchPickups(source);
+}
+
+function patchPickupCache(source, id, patchObj) {
+    const c = pickupsCache[source];
+    if (c && c.data && c.data[id]) {
+        c.data[id] = Object.assign({}, c.data[id], patchObj);
+        persistInventoryToLS(source, c.data);
+    }
+}
+
+function countUnsold(data) {
+    let n = 0;
+    if (!data) return 0;
+    for (const k in data) {
+        const it = data[k];
+        if (it && it.status === 'pickup' && !it.sold) n++;
+    }
+    return n;
+}
+
+function fetchUsers(source) {
+    const c = metaCache[source];
+    if (c.usersInflight) return c.usersInflight;
+    const p = getDb(source).ref('users').once('value').then(snap => {
+        c.users = snap.val() || {};
+        c.usersTs = Date.now();
+        return c.users;
+    }).catch(() => c.users || {}).then(r => { c.usersInflight = null; return r; },
+        e => { c.usersInflight = null; throw e; });
+    c.usersInflight = p;
+    return p;
+}
+
+function fetchAttendance(source) {
+    const c = metaCache[source];
+    if (c.attInflight) return c.attInflight;
+    const p = getDb(source).ref('attendance').once('value').then(snap => {
+        c.attendance = snap.val() || {};
+        c.attTs = Date.now();
+        return c.attendance;
+    }).catch(() => c.attendance || {}).then(r => { c.attInflight = null; return r; },
+        e => { c.attInflight = null; throw e; });
+    c.attInflight = p;
+    return p;
+}
+
+async function getUsers(source, force = false) {
+    const c = metaCache[source];
+    if (!force && c.users && (Date.now() - c.usersTs) < META_TTL) return c.users;
+    if (!force && c.users) { fetchUsers(source).catch(() => {}); return c.users; }
+    return fetchUsers(source);
+}
+
+async function getAttendance(source, force = false) {
+    const c = metaCache[source];
+    if (!force && c.attendance && (Date.now() - c.attTs) < META_TTL) return c.attendance;
+    if (!force && c.attendance) { fetchAttendance(source).catch(() => {}); return c.attendance; }
+    return fetchAttendance(source);
+}
+
+function prefetchSourceData(source) {
+    Promise.all([
+        fetchPickups(source).catch(() => {}),
+        fetchUsers(source).catch(() => {}),
+        fetchAttendance(source).catch(() => {})
+    ]).then(() => {
+        computeOverheadPerPhone(source)
+            .then(v => { overheadCache[source] = { ts: Date.now(), value: v }; persistOverheadToLS(); })
+            .catch(() => {});
+    }).catch(() => {});
+}
+
+// ================================================================
+// OVERHEAD CALCULATION (pure CPU from cache)
+// ================================================================
+async function computeOverheadPerPhone(source) {
+    const [users, attendance, pickups] = await Promise.all([
+        getUsers(source), getAttendance(source), getPickups(source)
+    ]);
+    const today = new Date();
+    let totalOverhead = 0;
+
+    for (const uname of Object.keys(users || {})) {
+        const uData = users[uname] || {};
+        const role = uData.role || 'agent';
+        if (role !== 'agent') continue;
+        const monthlySalary = Number(uData.salary) || 0;
+        if (monthlySalary <= 0) continue;
+        const perDaySalary = monthlySalary / 30;
+
+        let joinDate = null;
+        if (uData.joinDate) joinDate = new Date(uData.joinDate + 'T00:00:00');
+        else if (uData.createdAt) joinDate = new Date(uData.createdAt);
+        if (!joinDate || isNaN(joinDate)) joinDate = new Date(today);
+
+        let cur = new Date(joinDate);
+        const attUser = (attendance && attendance[uname]) || {};
+        while (cur <= today) {
+            const ds = getLocalYMD(cur);
+            const att = attUser[ds] || {};
+            if (att.status === 'present' && att.salary_counted !== false) {
+                totalOverhead += (att.half_day === true) ? perDaySalary * 0.5 : perDaySalary;
+            }
+            cur.setDate(cur.getDate() + 1);
+        }
+    }
+
+    let totalPickupIncentives = 0;
+    let totalRejectIncentives = 0;
+    const pk = pickups || {};
+    for (const id in pk) {
+        const item = pk[id];
+        if (!item || item.status === 'on_hold') continue;
+        const agent = item.agent;
+        if (!agent) continue;
+        const uData = users[agent];
+        if (!uData || (uData.role || 'agent') !== 'agent') continue;
+        if (item.status === 'pickup') totalPickupIncentives += Number(uData.pickup_incentive) || 0;
+        else if (item.status === 'rejected' && Boolean(item.incentive_approved)) totalRejectIncentives += Number(uData.reject_incentive) || 0;
+    }
+    totalOverhead += totalPickupIncentives + totalRejectIncentives;
+
+    let totalSold = 0;
+    for (const id in pk) {
+        const item = pk[id];
+        if (item && item.status === 'pickup' && item.sold) totalSold++;
+    }
+    return totalSold > 0 ? totalOverhead / totalSold : 0;
+}
+
+async function getOverheadPerPhone(source, force = false, timeoutMs = 1200) {
+    const c = overheadCache[source];
+    if (!force && c.ts && (Date.now() - c.ts) < OVERHEAD_TTL) return c.value;
+
+    const computePromise = computeOverheadPerPhone(source).then(v => {
+        overheadCache[source] = { ts: Date.now(), value: v };
+        persistOverheadToLS();
+        return v;
+    }).catch(() => c.value || 0);
+
+    if (!timeoutMs || timeoutMs <= 0) return computePromise;
+
+    const timeoutPromise = delay(timeoutMs).then(() => c.value || 0);
+    const result = await Promise.race([computePromise, timeoutPromise]);
+    return result;
+}
+
+// ================================================================
+// CONNECTION STATUS
+// ================================================================
 function setupOfflineDetection() {
     const updateStatus = () => {
         const isOnline = navigator.onLine;
@@ -240,7 +540,7 @@ function setupOfflineDetection() {
 }
 
 // ================================================================
-// VIEW TOGGLE (2 tabs: Inventory / Returns)
+// VIEW TOGGLE
 // ================================================================
 function switchView(view) {
     if (view !== 'inventory' && view !== 'returns') return;
@@ -251,12 +551,12 @@ function switchView(view) {
     document.getElementById('viewBtnInventory')?.classList.toggle('active', view === 'inventory');
     document.getElementById('viewBtnReturns')?.classList.toggle('active', view === 'returns');
 
-    document.getElementById('inventoryView').style.display = view === 'inventory' ? 'block' : 'none';
-    document.getElementById('returnsView').style.display = view === 'returns' ? 'block' : 'none';
+    const inv = document.getElementById('inventoryView');
+    const ret = document.getElementById('returnsView');
+    if (inv) inv.style.display = view === 'inventory' ? 'block' : 'none';
+    if (ret) ret.style.display = view === 'returns' ? 'block' : 'none';
 
-    if (view === 'returns' && !returnsDataLoaded) {
-        initReturnsView();
-    }
+    if (view === 'returns' && !returnsDataLoaded) initReturnsView();
     refreshIcons();
 }
 
@@ -285,33 +585,45 @@ function switchSource(source) {
     inventoryList = [];
     filteredInventory = [];
     renderInventory();
-    loadInventory();
+    loadInventory({ force: false });
+    prefetchSourceData(source);
 }
 
-async function loadInventory() {
-    const db = getDb(currentSource);
-    showToast('🔄 Loading ' + getSourceLabel(currentSource) + ' inventory…', 'info', 1500);
+function buildInventoryList(data, source) {
+    const list = [];
+    if (!data) return list;
+    for (const id in data) {
+        const item = data[id];
+        if (!item) continue;
+        if (item.status === 'pickup' && !item.sold) {
+            list.push(Object.assign({ id }, item, { _source: source }));
+        }
+    }
+    list.sort((a, b) => {
+        const ta = new Date(a.timestamp || 0).getTime() || 0;
+        const tb = new Date(b.timestamp || 0).getTime() || 0;
+        return tb - ta;
+    });
+    return list;
+}
+
+async function loadInventory(opts) {
+    const force = !!(opts && opts.force);
+    const source = currentSource;
     try {
-        const snap = await db.ref('pickups').once('value');
-        const data = snap.val() || {};
-        inventoryList = Object.entries(data)
-            .filter(([_, item]) => item.status === 'pickup' && !item.sold)
-            .map(([id, item]) => ({ id, ...item, _source: currentSource }));
-        inventoryList.sort((a, b) => {
-            const ta = new Date(a.timestamp || 0).getTime() || 0;
-            const tb = new Date(b.timestamp || 0).getTime() || 0;
-            return tb - ta;
-        });
-        lastUpdatedBySource[currentSource] = Date.now();
+        const data = await getPickups(source, force);
+        if (source !== currentSource) return;
+        inventoryList = buildInventoryList(data, source);
+        lastUpdatedBySource[source] = pickupsCache[source].ts || Date.now();
         applySearch();
         updateStats(data);
         updateLastUpdatedLabel();
     } catch (e) {
         console.error('Inventory load error:', e);
-        showToast('Error loading ' + getSourceLabel(currentSource) + ' inventory', 'error');
+        showToast('Error loading ' + getSourceLabel(source) + ' inventory', 'error');
         const tbody = document.getElementById('inventoryTableBody');
         const cards = document.getElementById('inventoryCards');
-        const errHtml = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Failed to load inventory</p></div>`;
+        const errHtml = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Failed to load inventory</p><p class="text-xs text-gray-400 mt-1">Tap refresh to retry</p></div>`;
         if (cards) cards.innerHTML = errHtml;
         if (tbody) tbody.innerHTML = `<tr><td colspan="7">${errHtml}</td></tr>`;
         refreshIcons();
@@ -319,12 +631,13 @@ async function loadInventory() {
 }
 
 function updateStats(pickupsData) {
-    if (!pickupsData) {
-        getDb(currentSource).ref('pickups').once('value').then(snap => updateStats(snap.val() || {})).catch(() => {});
-        return;
-    }
     let soldCount = 0;
-    Object.values(pickupsData).forEach(item => { if (item.sold === true) soldCount++; });
+    if (pickupsData) {
+        for (const k in pickupsData) {
+            const item = pickupsData[k];
+            if (item && item.sold === true) soldCount++;
+        }
+    }
     const elInv = document.getElementById('statInventory');
     const elSold = document.getElementById('statSold');
     if (elInv) elInv.textContent = inventoryList.length;
@@ -343,7 +656,7 @@ function applySearch() {
     const searchInput = document.getElementById('inventorySearch');
     const raw = (searchInput ? searchInput.value : '').trim().toLowerCase();
     if (!raw) {
-        filteredInventory = [...inventoryList];
+        filteredInventory = inventoryList.slice();
     } else {
         filteredInventory = inventoryList.filter(item => {
             const orderId = String(item.orderId || item.id || '').toLowerCase();
@@ -383,6 +696,7 @@ function renderMobileCards() {
         const model = escapeHtml(item.phoneModel || '—');
         const imei = escapeHtml(item.imei || '—');
         const cust = escapeHtml(item.customerName || '—');
+        const safeId = String(item.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         html += `
             <div class="inventory-card ${srcClass}">
                 <div class="flex items-start justify-between gap-2 mb-2 pl-2">
@@ -399,8 +713,8 @@ function renderMobileCards() {
                     <div class="flex items-center gap-1.5"><i data-lucide="user" class="w-3 h-3 flex-shrink-0"></i><span class="truncate">${cust}</span></div>
                 </div>
                 <div class="flex gap-2 mt-3 pl-2">
-                    <button onclick="openSellModal('${item.id}')" class="btn-action success flex-1"><i data-lucide="badge-dollar-sign"></i> Sell</button>
-                    <button onclick="viewOrderDetail('${item.id}', '${currentSource}')" class="btn-action view" title="View"><i data-lucide="eye"></i></button>
+                    <button onclick="openSellModal('${safeId}')" class="btn-action success flex-1"><i data-lucide="badge-dollar-sign"></i> Sell</button>
+                    <button onclick="viewOrderDetail('${safeId}', '${currentSource}')" class="btn-action view" title="View"><i data-lucide="eye"></i></button>
                 </div>
             </div>`;
     });
@@ -422,6 +736,7 @@ function renderDesktopTable() {
         const model = escapeHtml(item.phoneModel || '—');
         const imei = escapeHtml(item.imei || '—');
         const cust = escapeHtml(item.customerName || '—');
+        const safeId = String(item.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         html += `
             <tr class="border-b border-gray-50 hover:bg-gray-50 transition">
                 <td class="py-3 px-4 text-gray-400 font-mono text-xs">${idx + 1}</td>
@@ -432,8 +747,8 @@ function renderDesktopTable() {
                 <td class="py-3 px-4 text-gray-600 text-sm">${cust}</td>
                 <td class="py-3 px-4">
                     <div class="flex items-center gap-2">
-                        <button onclick="openSellModal('${item.id}')" class="btn-action success" style="padding:8px 14px;min-height:38px;font-size:12px;"><i data-lucide="badge-dollar-sign" style="width:16px;height:16px;"></i> Sell</button>
-                        <button onclick="viewOrderDetail('${item.id}', '${currentSource}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View"><i data-lucide="eye" style="width:16px;height:16px;"></i></button>
+                        <button onclick="openSellModal('${safeId}')" class="btn-action success" style="padding:8px 14px;min-height:38px;font-size:12px;"><i data-lucide="badge-dollar-sign" style="width:16px;height:16px;"></i> Sell</button>
+                        <button onclick="viewOrderDetail('${safeId}', '${currentSource}')" class="btn-action view" style="padding:8px 12px;min-height:38px;" title="View"><i data-lucide="eye" style="width:16px;height:16px;"></i></button>
                     </div>
                 </td>
             </tr>`;
@@ -441,75 +756,9 @@ function renderDesktopTable() {
     tbody.innerHTML = html;
 }
 
-// ---------- OVERHEAD ----------
-async function computeOverheadPerPhone(source) {
-    const db = getDb(source);
-    const [usersSnap, attendanceSnap, pickupsSnap] = await Promise.all([
-        db.ref('users').once('value'),
-        db.ref('attendance').once('value'),
-        db.ref('pickups').once('value')
-    ]);
-    const users = usersSnap.val() || {};
-    const attendance = attendanceSnap.val() || {};
-    const pickups = pickupsSnap.val() || {};
-    const today = new Date();
-    let totalOverhead = 0;
-
-    for (const [uname, uData] of Object.entries(users)) {
-        const role = uData.role || 'agent';
-        if (role !== 'agent') continue;
-        const monthlySalary = Number(uData.salary) || 0;
-        if (monthlySalary <= 0) continue;
-        const perDaySalary = monthlySalary / 30;
-        let joinDate = null;
-        if (uData.joinDate) joinDate = new Date(uData.joinDate + 'T00:00:00');
-        else if (uData.createdAt) joinDate = new Date(uData.createdAt);
-        if (!joinDate || isNaN(joinDate)) joinDate = new Date(today);
-        let cur = new Date(joinDate);
-        while (cur <= today) {
-            const ds = getLocalYMD(cur);
-            const att = (attendance[uname] && attendance[uname][ds]) || {};
-            const isPresent = att.status === 'present';
-            const salaryCounted = att.salary_counted !== false;
-            if (isPresent && salaryCounted) {
-                totalOverhead += (att.half_day === true) ? perDaySalary * 0.5 : perDaySalary;
-            }
-            cur.setDate(cur.getDate() + 1);
-        }
-    }
-
-    let totalPickupIncentives = 0;
-    let totalRejectIncentives = 0;
-    Object.values(pickups).forEach(item => {
-        if (!item || item.status === 'on_hold') return;
-        const agent = item.agent;
-        if (!agent) return;
-        const uData = users[agent];
-        if (!uData || (uData.role || 'agent') !== 'agent') return;
-        if (item.status === 'pickup') totalPickupIncentives += Number(uData.pickup_incentive) || 0;
-        else if (item.status === 'rejected' && Boolean(item.incentive_approved)) totalRejectIncentives += Number(uData.reject_incentive) || 0;
-    });
-    totalOverhead += totalPickupIncentives + totalRejectIncentives;
-
-    let totalSold = 0;
-    Object.values(pickups).forEach(item => { if (item && item.status === 'pickup' && item.sold) totalSold++; });
-    return totalSold > 0 ? totalOverhead / totalSold : 0;
-}
-
-async function getOverheadPerPhone(source, force = false) {
-    const cached = overheadCache[source];
-    if (!force && cached && cached.value > 0 && (Date.now() - cached.ts < OVERHEAD_TTL)) return cached.value;
-    try {
-        const value = await computeOverheadPerPhone(source);
-        overheadCache[source] = { ts: Date.now(), value };
-        return value;
-    } catch (e) {
-        console.warn('Overhead calc failed:', e);
-        return cached ? cached.value : 0;
-    }
-}
-
-// ---------- SELL MODAL ----------
+// ================================================================
+// SELL MODAL
+// ================================================================
 function openSellModal(orderId) {
     if (!isStillAuthorized()) { showLoginOverlay(); return; }
     const order = inventoryList.find(item => item.id === orderId);
@@ -540,7 +789,7 @@ function openSellModal(orderId) {
     if (modal) modal.style.display = 'flex';
     document.body.style.overflow = 'hidden';
     refreshIcons();
-    setTimeout(() => { const inp = document.getElementById('sellSalePrice'); if (inp) inp.focus(); }, 300);
+    setTimeout(() => { const inp = document.getElementById('sellSalePrice'); if (inp) inp.focus(); }, 250);
 }
 
 function closeSellModal() {
@@ -551,67 +800,94 @@ function closeSellModal() {
 }
 
 async function confirmSell() {
-    if (!(await assertSalesAccess())) return;
+    if (isSelling) return;
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     if (!sellOrderData) return;
+
     const salePriceRaw = document.getElementById('sellSalePrice').value.trim();
     const buyerName = document.getElementById('sellBuyerName').value.trim();
     const buyerContact = document.getElementById('sellBuyerContact').value.trim();
     const saleDate = document.getElementById('sellSaleDate').value || getLocalYMD();
     const salePrice = parseFloat(salePriceRaw);
 
-    if (!salePrice || salePrice <= 0 || isNaN(salePrice)) { showToast('Please enter a valid sale price', 'error'); document.getElementById('sellSalePrice').focus(); return; }
-    if (!buyerName) { showToast('Please enter buyer name', 'error'); document.getElementById('sellBuyerName').focus(); return; }
+    if (!salePrice || salePrice <= 0 || isNaN(salePrice)) {
+        showToast('Please enter a valid sale price', 'error');
+        document.getElementById('sellSalePrice').focus();
+        return;
+    }
+    if (!buyerName) {
+        showToast('Please enter buyer name', 'error');
+        document.getElementById('sellBuyerName').focus();
+        return;
+    }
 
     const order = sellOrderData;
     const source = currentSource;
     const sourceLabel = getSourceLabel(source);
 
-    const confirm = await Swal.fire({
-        title: 'Confirm Sale',
-        html: `
-            <div style="text-align:left;font-size:14px;line-height:1.7;">
-                <div style="margin-bottom:6px;">
-                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()}</span>
-                </div>
-                <p><strong>Order:</strong> ${escapeHtml(order.orderId || order.id)}</p>
-                <p><strong>Model:</strong> ${escapeHtml(order.phoneModel || '—')}</p>
-                <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
-                <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
-                <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
-                <p style="margin-top:6px;font-size:12px;color:#64748b;">🧑‍💼 Recording as: <strong>${escapeHtml(currentSalesUser.name)}</strong> (${escapeHtml(currentSalesUser.username)})</p>
-            </div>`,
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#059669',
-        cancelButtonColor: '#64748b',
-        confirmButtonText: '✅ Confirm Sale',
-        cancelButtonText: 'Cancel'
-    });
+    if (hasSwal()) {
+        try {
+            const confirm = await Swal.fire({
+                title: 'Confirm Sale',
+                html: `
+                    <div style="text-align:left;font-size:14px;line-height:1.7;">
+                        <div style="margin-bottom:6px;">
+                            <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:0.4px;background:${source === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${source === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${source === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()}</span>
+                        </div>
+                        <p><strong>Order:</strong> ${escapeHtml(order.orderId || order.id)}</p>
+                        <p><strong>Model:</strong> ${escapeHtml(order.phoneModel || '—')}</p>
+                        <p><strong>Sale Price:</strong> ₹${salePrice.toLocaleString('en-IN')}</p>
+                        <p><strong>Buyer:</strong> ${escapeHtml(buyerName)}</p>
+                        <p><strong>Sale Date:</strong> ${escapeHtml(saleDate)}</p>
+                        <p style="margin-top:6px;font-size:12px;color:#64748b;">🧑‍💼 Recording as: <strong>${escapeHtml(currentSalesUser.name)}</strong> (${escapeHtml(currentSalesUser.username)})</p>
+                    </div>`,
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonColor: '#059669',
+                cancelButtonColor: '#64748b',
+                confirmButtonText: '✅ Confirm Sale',
+                cancelButtonText: 'Cancel'
+            });
+            if (!confirm.isConfirmed) return;
+        } catch (_) {}
+    }
 
-    if (!confirm.isConfirmed) return;
-
+    isSelling = true;
     const confirmBtn = document.getElementById('confirmSellBtn');
     const originalBtnHtml = confirmBtn ? confirmBtn.innerHTML : '';
-    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Saving…'; }
+    if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Saving…';
+    }
 
     try {
-        const overhead = await getOverheadPerPhone(source, false);
+        let overheadTimedOut = false;
+        const overheadCompute = computeOverheadPerPhone(source)
+            .then(v => { overheadCache[source] = { ts: Date.now(), value: v }; persistOverheadToLS(); return v; })
+            .catch(() => (overheadCache[source] && overheadCache[source].value) || 0);
+
+        const cachedOverhead = (overheadCache[source] && overheadCache[source].value) || 0;
+        const overhead = await Promise.race([
+            overheadCompute,
+            delay(1200).then(() => { overheadTimedOut = true; return cachedOverhead; })
+        ]);
+
         const purchase = Number(order.value) || 0;
-        let writePayload = {
+        const writePayload = {
             sold: true, returned: false,
             salePrice, buyerName, buyerContact: buyerContact || '', saleDate,
             saleTimestamp: new Date().toISOString(),
             salesBy: currentSalesUser.username,
-            salesByName: currentSalesUser.name
+            salesByName: currentSalesUser.name,
+            overheadPerPhone: overhead
         };
 
         if (source === 'flipkart') {
             const commission = calculateCommission(purchase);
             const grossProfit = salePrice - purchase - commission;
-            const finalProfit = grossProfit - overhead;
             writePayload.commission = commission;
             writePayload.grossProfit = grossProfit;
-            writePayload.finalNetProfit = finalProfit;
+            writePayload.finalNetProfit = grossProfit - overhead;
             writePayload.profit = grossProfit;
         } else {
             const coins = Number(order.coins) || 0;
@@ -619,34 +895,61 @@ async function confirmSell() {
             const coinsValue = (order.coinTotalValue !== undefined && order.coinTotalValue !== null) ? Number(order.coinTotalValue) : coins * rate;
             const actualCost = (order.actualTotalCost !== undefined && order.actualTotalCost !== null) ? Number(order.actualTotalCost) : purchase + coinsValue;
             const grossProfit = salePrice - actualCost;
-            const finalProfit = grossProfit - overhead;
             writePayload.grossProfit = grossProfit;
-            writePayload.finalNetProfit = finalProfit;
+            writePayload.finalNetProfit = grossProfit - overhead;
         }
 
         await getDb(source).ref('pickups/' + order.id).update(writePayload);
 
-        allSoldPhonesBoth = [];
-        allExchangeInventoryBoth = [];
-        returnsDataLoaded = false;
+        patchPickupCache(source, order.id, writePayload);
+        pickupsCache[source].ts = pickupsCache[source].ts || Date.now();
 
-        await loadInventory();
-        await loadRecentSalesHistory();
-
-        closeSellModal();
-
-        let stockCount = 0;
-        try { stockCount = await getSourceInventoryCount(source); } catch (_) {}
-
-        const mergedItem = { ...order, ...writePayload };
+        const stockCount = countUnsold(pickupsCache[source].data);
+        const mergedItem = Object.assign({}, order, writePayload);
         const message = buildSaleMessage(mergedItem, salePrice, source, stockCount);
-        await showSaleSuccessModal(message);
 
-        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success');
+        inventoryList = inventoryList.filter(i => i.id !== order.id);
+        lastUpdatedBySource[source] = Date.now();
+        applySearch();
+        updateStats(pickupsCache[source].data);
+        updateLastUpdatedLabel();
+        closeSellModal();
+        showToast(`✅ Sold from ${sourceLabel} for ₹${salePrice.toLocaleString('en-IN')}`, 'success', 2200);
+
+        showSaleSuccessModal(message).catch(() => {});
+
+        setTimeout(() => {
+            try {
+                loadRecentSalesHistory();
+                if (!returnsDataLoaded) { allSoldPhonesBoth = []; allExchangeInventoryBoth = []; }
+                else { allSoldPhonesBoth = []; allExchangeInventoryBoth = []; returnsDataLoaded = false; }
+                if (currentView === 'returns') loadReturnsHistory();
+                loadReturnsInventoryCounts();
+            } catch (_) {}
+        }, 50);
+
+        if (overheadTimedOut) {
+            overheadCompute.then(v => {
+                if (v && Math.abs(v - overhead) > 0.5) patchProfitWithOverhead(source, order.id, v, order, salePrice, writePayload);
+            }).catch(() => {});
+        }
+
+        setTimeout(() => {
+            fetchPickups(source).then(() => {
+                if (currentSource === source) {
+                    inventoryList = buildInventoryList(pickupsCache[source].data, source);
+                    applySearch();
+                    updateStats(pickupsCache[source].data);
+                    updateLastUpdatedLabel();
+                }
+            }).catch(() => {});
+        }, 1500);
+
     } catch (e) {
         console.error('Sale error:', e);
         showToast('Error saving sale. Please try again.', 'error');
     } finally {
+        isSelling = false;
         if (confirmBtn) {
             confirmBtn.disabled = false;
             confirmBtn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle" class="w-4 h-4"></i> Confirm Sale';
@@ -655,7 +958,32 @@ async function confirmSell() {
     }
 }
 
-// ---------- VIEW DETAIL ----------
+async function patchProfitWithOverhead(source, id, overheadValue, order, salePrice, writePayload) {
+    try {
+        let finalNetProfit;
+        if (source === 'flipkart') {
+            const purchase = Number(order.value) || 0;
+            const commission = Number(writePayload.commission) || 0;
+            finalNetProfit = salePrice - purchase - commission - overheadValue;
+        } else {
+            const purchase = Number(order.value) || 0;
+            const coins = Number(order.coins) || 0;
+            const rate = Number(order.coinValueRate) || 12.5;
+            const coinsValue = (order.coinTotalValue !== undefined && order.coinTotalValue !== null) ? Number(order.coinTotalValue) : coins * rate;
+            const actualCost = (order.actualTotalCost !== undefined && order.actualTotalCost !== null) ? Number(order.actualTotalCost) : purchase + coinsValue;
+            finalNetProfit = salePrice - actualCost - overheadValue;
+        }
+        const patch = { finalNetProfit, overheadPerPhone: overheadValue };
+        await getDb(source).ref('pickups/' + id).update(patch);
+        patchPickupCache(source, id, patch);
+    } catch (e) {
+        console.warn('[SalesManager] Profit patch failed:', e);
+    }
+}
+
+// ================================================================
+// VIEW DETAIL
+// ================================================================
 async function viewOrderDetail(orderId, sourceOverride) {
     if (!isStillAuthorized()) { showLoginOverlay(); return; }
     const modal = document.getElementById('detailModal');
@@ -664,62 +992,80 @@ async function viewOrderDetail(orderId, sourceOverride) {
     const source = sourceOverride || currentSource;
     modal.style.display = 'flex';
     document.body.style.overflow = 'hidden';
-    content.innerHTML = `<div class="text-center py-8 text-gray-400"><span class="spinner-sm"></span><p class="text-sm mt-2">Loading...</p></div>`;
+
+    const cached = pickupsCache[source].data && pickupsCache[source].data[orderId];
+    if (cached) renderDetail(cached, orderId, source);
+    else content.innerHTML = `<div class="text-center py-8 text-gray-400"><span class="spinner-sm"></span><p class="text-sm mt-2">Loading...</p></div>`;
 
     try {
-        const snap = await getDb(source).ref('pickups/' + orderId).once('value');
+        const snap = await withTimeout(getDb(source).ref('pickups/' + orderId).once('value'), 8000);
         const item = snap.val();
-        if (!item) { content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium">Order not found</p></div>`; refreshIcons(); return; }
-
-        const statusLabel = item.status || 'unknown';
-        const isSold = item.sold === true;
-        const isReturned = item.returned === true;
-        let statusDisplay, statusClass;
-        if (isReturned && !isSold) { statusDisplay = 'Returned'; statusClass = 'sold'; }
-        else if (isSold) { statusDisplay = 'Sold'; statusClass = 'sold'; }
-        else if (statusLabel === 'pickup') { statusDisplay = 'Pickup'; statusClass = 'available'; }
-        else if (statusLabel === 'rejected') { statusDisplay = 'Rejected'; statusClass = 'rejected'; }
-        else { statusDisplay = 'Pending'; statusClass = 'available'; }
-
-        const sourceLabel = getSourceLabel(source);
-        const pillClass = source === 'cashify' ? 'cashify' : 'flipkart';
-
-        let saleHtml = '';
-        if (isSold || isReturned) {
-            saleHtml = `
-                <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${Number(item.salePrice || item.lastSalePrice || 0).toLocaleString('en-IN')}</div></div>
-                <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(item.buyerName || item.lastBuyerName || '—')}</div></div>
-                <div class="detail-item"><div class="label">Sale Date</div><div class="value">${escapeHtml(item.saleDate || item.lastSaleDate || '—')}</div></div>
-                ${item.salesByName ? `<div class="detail-item"><div class="label">Sold By</div><div class="value">${escapeHtml(item.salesByName)}${item.salesBy ? ' <span style="color:#94a3b8;font-size:11px;">(' + escapeHtml(item.salesBy) + ')</span>' : ''}</div></div>` : ''}
-                ${isReturned ? `<div class="detail-item"><div class="label">Return Date</div><div class="value" style="color:#dc2626;">${escapeHtml(item.returnDate || '—')}</div></div>` : ''}
-            `;
+        if (!item) {
+            if (!cached) {
+                content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium">Order not found</p></div>`;
+                refreshIcons();
+            }
+            return;
         }
-        const ramStorage = item.ramStorage ? escapeHtml(item.ramStorage) : (item.ram && item.storage ? escapeHtml(item.ram + ' / ' + item.storage) : '—');
-        content.innerHTML = `
-            <div class="flex items-center gap-2 flex-wrap mb-4">
-                <span class="badge-status ${statusClass} text-sm px-4 py-1.5">${statusDisplay}</span>
-                <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
-                <span class="font-mono font-bold text-gray-800 text-sm">${escapeHtml(item.orderId || orderId)}</span>
-            </div>
-            <div class="detail-grid">
-                <div class="detail-item"><div class="label">Phone Model</div><div class="value">${escapeHtml(item.phoneModel || '—')}</div></div>
-                <div class="detail-item"><div class="label">IMEI</div><div class="value font-mono text-xs">${escapeHtml(item.imei || '—')}</div></div>
-                ${item.imei2 ? `<div class="detail-item"><div class="label">IMEI 2</div><div class="value font-mono text-xs">${escapeHtml(item.imei2)}</div></div>` : ''}
-                <div class="detail-item"><div class="label">RAM / Storage</div><div class="value">${ramStorage}</div></div>
-                <div class="detail-item"><div class="label">Network</div><div class="value">${escapeHtml(item.networkType || '—')}</div></div>
-                <div class="detail-item"><div class="label">Customer</div><div class="value">${escapeHtml(item.customerName || '—')}</div></div>
-                <div class="detail-item"><div class="label">Reason</div><div class="value">${escapeHtml(item.reason || '—')}</div></div>
-                <div class="detail-item"><div class="label">Time (IST)</div><div class="value text-xs">${escapeHtml(item.timestampIST || item.timestamp || '—')}</div></div>
-                ${item.agent ? `<div class="detail-item"><div class="label">Agent</div><div class="value">${escapeHtml(item.agent)}</div></div>` : ''}
-                ${saleHtml}
-            </div>`;
-        refreshIcons();
+        if (pickupsCache[source].data) pickupsCache[source].data[orderId] = item;
+        renderDetail(item, orderId, source);
     } catch (err) {
         console.error('Detail load error:', err);
-        content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Error loading details</p></div>`;
-        refreshIcons();
-        showToast('Error loading order details', 'error');
+        if (!cached) {
+            content.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><p class="text-sm font-medium text-red-500">Error loading details</p></div>`;
+            refreshIcons();
+            showToast('Error loading order details', 'error');
+        }
     }
+}
+
+function renderDetail(item, orderId, source) {
+    const content = document.getElementById('detailContent');
+    if (!content) return;
+    const statusLabel = item.status || 'unknown';
+    const isSold = item.sold === true;
+    const isReturned = item.returned === true;
+    let statusDisplay, statusClass;
+    if (isReturned && !isSold) { statusDisplay = 'Returned'; statusClass = 'sold'; }
+    else if (isSold) { statusDisplay = 'Sold'; statusClass = 'sold'; }
+    else if (statusLabel === 'pickup') { statusDisplay = 'Pickup'; statusClass = 'available'; }
+    else if (statusLabel === 'rejected') { statusDisplay = 'Rejected'; statusClass = 'rejected'; }
+    else { statusDisplay = 'Pending'; statusClass = 'available'; }
+
+    const sourceLabel = getSourceLabel(source);
+    const pillClass = source === 'cashify' ? 'cashify' : 'flipkart';
+
+    let saleHtml = '';
+    if (isSold || isReturned) {
+        saleHtml = `
+            <div class="detail-item"><div class="label">Sale Price</div><div class="value">₹${Number(item.salePrice || item.lastSalePrice || 0).toLocaleString('en-IN')}</div></div>
+            <div class="detail-item"><div class="label">Buyer</div><div class="value">${escapeHtml(item.buyerName || item.lastBuyerName || '—')}</div></div>
+            <div class="detail-item"><div class="label">Sale Date</div><div class="value">${escapeHtml(item.saleDate || item.lastSaleDate || '—')}</div></div>
+            ${item.salesByName ? `<div class="detail-item"><div class="label">Sold By</div><div class="value">${escapeHtml(item.salesByName)}${item.salesBy ? ' <span style="color:#94a3b8;font-size:11px;">(' + escapeHtml(item.salesBy) + ')</span>' : ''}</div></div>` : ''}
+            ${isReturned ? `<div class="detail-item"><div class="label">Return Date</div><div class="value" style="color:#dc2626;">${escapeHtml(item.returnDate || '—')}</div></div>` : ''}
+        `;
+    }
+    const ramStorage = item.ramStorage ? escapeHtml(item.ramStorage) : (item.ram && item.storage ? escapeHtml(item.ram + ' / ' + item.storage) : '—');
+
+    content.innerHTML = `
+        <div class="flex items-center gap-2 flex-wrap mb-4">
+            <span class="badge-status ${statusClass} text-sm px-4 py-1.5">${statusDisplay}</span>
+            <span class="src-pill ${pillClass}"><span class="dot"></span>${sourceLabel}</span>
+            <span class="font-mono font-bold text-gray-800 text-sm">${escapeHtml(item.orderId || orderId)}</span>
+        </div>
+        <div class="detail-grid">
+            <div class="detail-item"><div class="label">Phone Model</div><div class="value">${escapeHtml(item.phoneModel || '—')}</div></div>
+            <div class="detail-item"><div class="label">IMEI</div><div class="value font-mono text-xs">${escapeHtml(item.imei || '—')}</div></div>
+            ${item.imei2 ? `<div class="detail-item"><div class="label">IMEI 2</div><div class="value font-mono text-xs">${escapeHtml(item.imei2)}</div></div>` : ''}
+            <div class="detail-item"><div class="label">RAM / Storage</div><div class="value">${ramStorage}</div></div>
+            <div class="detail-item"><div class="label">Network</div><div class="value">${escapeHtml(item.networkType || '—')}</div></div>
+            <div class="detail-item"><div class="label">Customer</div><div class="value">${escapeHtml(item.customerName || '—')}</div></div>
+            <div class="detail-item"><div class="label">Reason</div><div class="value">${escapeHtml(item.reason || '—')}</div></div>
+            <div class="detail-item"><div class="label">Time (IST)</div><div class="value text-xs">${escapeHtml(item.timestampIST || item.timestamp || '—')}</div></div>
+            ${item.agent ? `<div class="detail-item"><div class="label">Agent</div><div class="value">${escapeHtml(item.agent)}</div></div>` : ''}
+            ${saleHtml}
+        </div>`;
+    refreshIcons();
 }
 
 function closeDetailModal() {
@@ -728,27 +1074,35 @@ function closeDetailModal() {
     document.body.style.overflow = '';
 }
 
-// ---------- REFRESH (view-aware) ----------
+// ---------- REFRESH ----------
 async function refreshInventory() {
     if (!isStillAuthorized()) { showLoginOverlay(); return; }
     if (isRefreshing) return;
     isRefreshing = true;
     showToast('🔄 Refreshing…', 'info', 1200);
 
-    if (currentView === 'returns') {
-        await refreshSoldPhonesCache();
-        renderReturnSearchResults(document.getElementById('returnSearch')?.value || '');
-        await loadReturnsHistory();
-        await loadReturnsInventoryCounts();
-    } else {
-        overheadCache[currentSource] = { ts: 0, value: 0 };
-        await loadInventory();
+    try {
+        if (currentView === 'returns') {
+            await Promise.all([
+                getPickups('flipkart', true),
+                getPickups('cashify', true)
+            ]);
+            await refreshSoldPhonesCache(true);
+            renderReturnSearchResults(document.getElementById('returnSearch')?.value || '');
+            await loadReturnsHistory();
+            await loadReturnsInventoryCounts();
+        } else {
+            overheadCache[currentSource] = { ts: 0, value: 0 };
+            await loadInventory({ force: true });
+            prefetchSourceData(currentSource);
+        }
+        try { await loadRecentSalesHistory(true); } catch (_) {}
+        showToast('✅ Refreshed', 'success', 1500);
+    } catch (e) {
+        showToast('Refresh failed — check connection', 'error');
+    } finally {
+        isRefreshing = false;
     }
-
-    try { await loadRecentSalesHistory(); } catch (_) {}
-
-    isRefreshing = false;
-    showToast('✅ Refreshed', 'success', 1500);
 }
 
 // ================================================================
@@ -756,7 +1110,7 @@ async function refreshInventory() {
 // ================================================================
 async function initReturnsView() {
     try {
-        await Promise.all([refreshSoldPhonesCache(), loadReturnsInventoryCounts()]);
+        await Promise.all([refreshSoldPhonesCache(false), loadReturnsInventoryCounts()]);
         returnsDataLoaded = true;
         renderReturnSearchResults('');
         await loadReturnsHistory();
@@ -768,22 +1122,23 @@ async function initReturnsView() {
     refreshIcons();
 }
 
-async function refreshSoldPhonesCache() {
-    const [fkSnap, cfSnap] = await Promise.all([
-        flipkartDb.ref('pickups').once('value'),
-        cashifyDb.ref('pickups').once('value')
+async function refreshSoldPhonesCache(force = false) {
+    const [fk, cf] = await Promise.all([
+        getPickups('flipkart', force),
+        getPickups('cashify', force)
     ]);
-    const fk = fkSnap.val() || {};
-    const cf = cfSnap.val() || {};
-    const isSoldNotReturned = (item) =>
-        item && item.status === 'pickup' && item.sold === true && item.returned !== true;
+    const isSoldNotReturned = (item) => item && item.status === 'pickup' && item.sold === true && item.returned !== true;
 
-    const fkSold = Object.entries(fk)
-        .filter(([_, item]) => isSoldNotReturned(item))
-        .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'flipkart' }));
-    const cfSold = Object.entries(cf)
-        .filter(([_, item]) => isSoldNotReturned(item))
-        .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'cashify' }));
+    const fkSold = [];
+    for (const id in fk) {
+        const item = fk[id];
+        if (isSoldNotReturned(item)) fkSold.push(decorateForSearch(Object.assign({ id }, item, { _source: 'flipkart' })));
+    }
+    const cfSold = [];
+    for (const id in cf) {
+        const item = cf[id];
+        if (isSoldNotReturned(item)) cfSold.push(decorateForSearch(Object.assign({ id }, item, { _source: 'cashify' })));
+    }
 
     allSoldPhonesBoth = [...fkSold, ...cfSold].sort((a, b) => {
         const ta = new Date(a.saleTimestamp || a.timestamp || 0).getTime() || 0;
@@ -794,26 +1149,18 @@ async function refreshSoldPhonesCache() {
 
 async function loadReturnsInventoryCounts() {
     try {
-        const [fkSnap, cfSnap] = await Promise.all([
-            flipkartDb.ref('pickups').once('value'),
-            cashifyDb.ref('pickups').once('value')
-        ]);
-        const countUnsold = (data) => {
-            let n = 0;
-            Object.values(data || {}).forEach(item => { if (item && item.status === 'pickup' && !item.sold) n++; });
-            return n;
-        };
+        const [fk, cf] = await Promise.all([getPickups('flipkart'), getPickups('cashify')]);
         const fkEl = document.getElementById('flipkartInvCount');
         const cfEl = document.getElementById('cashifyInvCount');
-        if (fkEl) fkEl.textContent = countUnsold(fkSnap.val());
-        if (cfEl) cfEl.textContent = countUnsold(cfSnap.val());
+        if (fkEl) fkEl.textContent = countUnsold(fk);
+        if (cfEl) cfEl.textContent = countUnsold(cf);
     } catch (e) { console.warn('Counts load failed:', e); }
 }
 
 // ---------- RETURN SEARCH ----------
 function handleReturnSearchInput(value) {
     clearTimeout(returnSearchDebounce);
-    returnSearchDebounce = setTimeout(() => renderReturnSearchResults(value), 150);
+    returnSearchDebounce = setTimeout(() => renderReturnSearchResults(value), 120);
 }
 
 function renderReturnSearchResults(query) {
@@ -822,9 +1169,7 @@ function renderReturnSearchResults(query) {
 
     const q = String(query || '').trim();
     let filtered = allSoldPhonesBoth;
-    if (q) {
-        filtered = allSoldPhonesBoth.filter(item => phoneMatchesQuery(item, q));
-    }
+    if (q) filtered = allSoldPhonesBoth.filter(item => phoneMatchesQuery(item, q));
     filteredReturnResults = filtered;
 
     const infoEl = document.getElementById('returnSearchInfo');
@@ -867,9 +1212,10 @@ function renderReturnSearchResults(query) {
         const salePrice = Number(item.salePrice) || 0;
         const saleDate = item.saleDate || (item.saleTimestamp ? getLocalYMD(new Date(item.saleTimestamp)) : '—');
         const isActive = selectedReturnPhone && selectedReturnPhone.id === item.id && selectedReturnPhone._source === src;
+        const safeId = String(item.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
         html += `
-            <div class="return-result-card ${isActive ? 'active' : ''}" onclick="selectReturnPhone('${item.id}', '${src}')">
+            <div class="return-result-card ${isActive ? 'active' : ''}" onclick="selectReturnPhone('${safeId}', '${src}')">
                 <div class="flex items-start justify-between gap-2 mb-1">
                     <div class="min-w-0 flex-1">
                         <div class="font-mono font-bold text-gray-800 text-sm truncate">${escapeHtml(item.orderId || item.id)}</div>
@@ -897,7 +1243,7 @@ function clearReturnSearch() {
 
 function scrollToReturnSettlement() {
     const settlement = document.getElementById('returnTypeMoneyLabel');
-    if (settlement) settlement.scrollIntoView({ behavior: 'instant', block: 'center' });
+    if (settlement) settlement.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function selectReturnPhone(id, source) {
@@ -1017,7 +1363,7 @@ function onReturnTypeChange() {
 
     if (type === 'exchange') {
         if (!allExchangeInventoryBoth.length) {
-            loadExchangeInventoryBoth().then(() => renderExchangeResults(''));
+            loadExchangeInventoryBoth().then(() => renderExchangeResults('')).catch(() => {});
         } else {
             renderExchangeResults('');
         }
@@ -1026,20 +1372,13 @@ function onReturnTypeChange() {
 
 // ---------- EXCHANGE INVENTORY ----------
 async function loadExchangeInventoryBoth() {
-    const [fkSnap, cfSnap] = await Promise.all([
-        flipkartDb.ref('pickups').once('value'),
-        cashifyDb.ref('pickups').once('value')
-    ]);
-    const fk = fkSnap.val() || {};
-    const cf = cfSnap.val() || {};
+    const [fk, cf] = await Promise.all([getPickups('flipkart'), getPickups('cashify')]);
     const isAvailable = (item) => item && item.status === 'pickup' && !item.sold;
 
-    const fkAvail = Object.entries(fk)
-        .filter(([_, item]) => isAvailable(item))
-        .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'flipkart' }));
-    const cfAvail = Object.entries(cf)
-        .filter(([_, item]) => isAvailable(item))
-        .map(([id, item]) => decorateForSearch({ id, ...item, _source: 'cashify' }));
+    const fkAvail = [];
+    for (const id in fk) if (isAvailable(fk[id])) fkAvail.push(decorateForSearch(Object.assign({ id }, fk[id], { _source: 'flipkart' })));
+    const cfAvail = [];
+    for (const id in cf) if (isAvailable(cf[id])) cfAvail.push(decorateForSearch(Object.assign({ id }, cf[id], { _source: 'cashify' })));
 
     allExchangeInventoryBoth = [...fkAvail, ...cfAvail].sort((a, b) =>
         String(a.phoneModel || '').localeCompare(String(b.phoneModel || ''))
@@ -1048,7 +1387,7 @@ async function loadExchangeInventoryBoth() {
 
 function handleExchangeSearchInput(value) {
     clearTimeout(exchangeSearchDebounce);
-    exchangeSearchDebounce = setTimeout(() => renderExchangeResults(value), 150);
+    exchangeSearchDebounce = setTimeout(() => renderExchangeResults(value), 120);
 }
 
 function renderExchangeResults(query) {
@@ -1077,8 +1416,9 @@ function renderExchangeResults(query) {
         const pillClass = src === 'cashify' ? 'cashify' : 'flipkart';
         const srcLabel = src === 'cashify' ? 'Cashify' : 'Flipkart';
         const isSel = selectedExchangePhone && selectedExchangePhone.id === item.id && selectedExchangePhone._source === src;
+        const safeId = String(item.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         html += `
-            <div class="exchange-pick-item ${isSel ? 'selected' : ''}" onclick="selectExchangePhone('${item.id}', '${src}')">
+            <div class="exchange-pick-item ${isSel ? 'selected' : ''}" onclick="selectExchangePhone('${safeId}', '${src}')">
                 <div class="flex items-start justify-between gap-2">
                     <div class="min-w-0 flex-1">
                         <div class="flex items-center gap-1.5 mb-0.5 flex-wrap">
@@ -1147,8 +1487,9 @@ function clearExchangeSearchInput() {
 
 // ---------- SUBMIT RETURN ----------
 async function submitReturn() {
-    if (!(await assertSalesAccess())) return;
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     if (!selectedReturnPhone) { showToast('Please select a sold phone first', 'error'); return; }
+
     const returnDate = document.getElementById('returnDate').value || getLocalYMD();
     const type = document.querySelector('input[name="returnType"]:checked')?.value || 'money';
     let returnAmount = 0;
@@ -1156,7 +1497,11 @@ async function submitReturn() {
 
     if (type === 'money') {
         returnAmount = parseFloat(document.getElementById('returnAmount').value);
-        if (!returnAmount || returnAmount <= 0 || isNaN(returnAmount)) { showToast('Enter a valid return amount', 'error'); document.getElementById('returnAmount').focus(); return; }
+        if (!returnAmount || returnAmount <= 0 || isNaN(returnAmount)) {
+            showToast('Enter a valid return amount', 'error');
+            document.getElementById('returnAmount').focus();
+            return;
+        }
     } else {
         if (!selectedExchangePhone) { showToast('Please select an exchange phone', 'error'); return; }
         exchangePhone = selectedExchangePhone;
@@ -1167,42 +1512,49 @@ async function submitReturn() {
     const sourceLabel = getSourceLabel(originalSource);
     const originalSalePrice = Number(original.salePrice) || 0;
 
-    const confirm = await Swal.fire({
-        title: 'Confirm Return Processing',
-        html: `
-            <div style="text-align:left;font-size:13px;line-height:1.6;">
-                <div style="margin-bottom:8px;">
-                    <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;background:${originalSource === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${originalSource === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${originalSource === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()} RETURN</span>
-                </div>
-                <p><strong>Order:</strong> ${escapeHtml(original.orderId || original.id)}</p>
-                <p><strong>Model:</strong> ${escapeHtml(original.phoneModel || '—')}</p>
-                <p><strong>IMEI:</strong> ${escapeHtml(original.imei || '—')}</p>
-                <p><strong>Original Sale:</strong> ₹${originalSalePrice.toLocaleString('en-IN')}</p>
-                <hr style="margin:8px 0;">
-                <p><strong>Return Date:</strong> ${escapeHtml(returnDate)}</p>
-                ${type === 'money'
-                    ? `<p><strong>Return Amount:</strong> ₹${returnAmount.toLocaleString('en-IN')} (Cash to customer)</p>`
-                    : `<p><strong>Exchange Phone:</strong> ${escapeHtml(exchangePhone.phoneModel)} (${escapeHtml(exchangePhone.imei)})</p>
-                       <p><strong>Exchange Source:</strong> ${getSourceLabel(exchangePhone._source)}</p>`}
-                <p style="margin-top:8px;color:#dc2626;font-size:12px;"><strong>⚠️ Inventory will be updated automatically.</strong></p>
-            </div>`,
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#dc2626',
-        cancelButtonColor: '#64748b',
-        confirmButtonText: '✅ Yes, Process Return',
-        cancelButtonText: 'Cancel'
-    });
-    if (!confirm.isConfirmed) return;
+    if (hasSwal()) {
+        try {
+            const confirm = await Swal.fire({
+                title: 'Confirm Return Processing',
+                html: `
+                    <div style="text-align:left;font-size:13px;line-height:1.6;">
+                        <div style="margin-bottom:8px;">
+                            <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;background:${originalSource === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${originalSource === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${originalSource === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()} RETURN</span>
+                        </div>
+                        <p><strong>Order:</strong> ${escapeHtml(original.orderId || original.id)}</p>
+                        <p><strong>Model:</strong> ${escapeHtml(original.phoneModel || '—')}</p>
+                        <p><strong>IMEI:</strong> ${escapeHtml(original.imei || '—')}</p>
+                        <p><strong>Original Sale:</strong> ₹${originalSalePrice.toLocaleString('en-IN')}</p>
+                        <hr style="margin:8px 0;">
+                        <p><strong>Return Date:</strong> ${escapeHtml(returnDate)}</p>
+                        ${type === 'money'
+                            ? `<p><strong>Return Amount:</strong> ₹${returnAmount.toLocaleString('en-IN')} (Cash to customer)</p>`
+                            : `<p><strong>Exchange Phone:</strong> ${escapeHtml(exchangePhone.phoneModel)} (${escapeHtml(exchangePhone.imei)})</p>
+                               <p><strong>Exchange Source:</strong> ${getSourceLabel(exchangePhone._source)}</p>`}
+                        <p style="margin-top:8px;color:#dc2626;font-size:12px;"><strong>⚠️ Inventory will be updated automatically.</strong></p>
+                    </div>`,
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonColor: '#dc2626',
+                cancelButtonColor: '#64748b',
+                confirmButtonText: '✅ Yes, Process Return',
+                cancelButtonText: 'Cancel'
+            });
+            if (!confirm.isConfirmed) return;
+        } catch (_) {}
+    }
 
     const btn = document.getElementById('processReturnBtn');
     const originalBtnHtml = btn ? btn.innerHTML : '';
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Processing...'; }
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-sm" style="width:16px;height:16px;border-width:2px;border-top-color:#fff;border-color:rgba(255,255,255,0.35);"></span> Processing...';
+    }
 
     try {
         const originalDb = getDb(originalSource);
-        const freshSnap = await originalDb.ref('pickups/' + original.id).once('value');
-        const fresh = freshSnap.val();
+        const freshSnap = await withTimeout(originalDb.ref('pickups/' + original.id).once('value'), 8000).catch(() => null);
+        const fresh = freshSnap ? freshSnap.val() : null;
         if (!fresh || fresh.sold !== true || fresh.returned === true) {
             showToast('This phone is no longer eligible for return', 'error');
             if (btn) { btn.disabled = false; btn.innerHTML = originalBtnHtml; refreshIcons(); }
@@ -1236,7 +1588,7 @@ async function submitReturn() {
 
         await originalDb.ref('returns/' + returnId).set(returnRecord);
 
-        await originalDb.ref('pickups/' + original.id).update({
+        const originalPatch = {
             sold: false, returned: true, returnDate, returnId,
             lastSalePrice: originalSalePrice,
             lastSaleDate: original.saleDate || '',
@@ -1244,7 +1596,9 @@ async function submitReturn() {
             salePrice: null, buyerName: null, buyerContact: null,
             saleDate: null, saleTimestamp: null,
             grossProfit: null, finalNetProfit: null, profit: null, commission: null
-        });
+        };
+        await originalDb.ref('pickups/' + original.id).update(originalPatch);
+        patchPickupCache(originalSource, original.id, originalPatch);
 
         if (type === 'exchange' && exchangePhone) {
             const exchangeDb = getDb(exchangePhone._source);
@@ -1270,24 +1624,11 @@ async function submitReturn() {
                 exchangePayload.finalNetProfit = 0;
             }
             await exchangeDb.ref('pickups/' + exchangePhone.id).update(exchangePayload);
+            patchPickupCache(exchangePhone._source, exchangePhone.id, exchangePayload);
         }
 
-        const [fkSnap2, cfSnap2] = await Promise.all([
-            flipkartDb.ref('pickups').once('value'),
-            cashifyDb.ref('pickups').once('value')
-        ]);
-        const countUnsold = (data) => {
-            let n = 0;
-            Object.values(data || {}).forEach(item => { if (item && item.status === 'pickup' && !item.sold) n++; });
-            return n;
-        };
-        const fkCount = countUnsold(fkSnap2.val());
-        const cfCount = countUnsold(cfSnap2.val());
-
-        await originalDb.ref('returns/' + returnId).update({
-            inventoryCountFlipkart: fkCount,
-            inventoryCountCashify: cfCount
-        });
+        const fkCount = countUnsold(pickupsCache.flipkart.data);
+        const cfCount = countUnsold(pickupsCache.cashify.data);
         returnRecord.inventoryCountFlipkart = fkCount;
         returnRecord.inventoryCountCashify = cfCount;
 
@@ -1296,20 +1637,40 @@ async function submitReturn() {
         allSoldPhonesBoth = [];
         allExchangeInventoryBoth = [];
         returnsDataLoaded = false;
-
         cancelReturnSelection();
-        await refreshSoldPhonesCache();
-        returnsDataLoaded = true;
-        renderReturnSearchResults(document.getElementById('returnSearch')?.value || '');
-        await Promise.all([loadReturnsHistory(), loadReturnsInventoryCounts(), loadRecentSalesHistory()]);
-        if (currentView === 'inventory') loadInventory();
+        showToast('✅ Return processed', 'success', 2200);
+        showReturnSuccessModal(message).catch(() => {});
 
-        showReturnSuccessModal(message);
+        setTimeout(async () => {
+            try {
+                await refreshSoldPhonesCache(false);
+                returnsDataLoaded = true;
+                renderReturnSearchResults(document.getElementById('returnSearch')?.value || '');
+                loadReturnsHistory();
+                loadReturnsInventoryCounts();
+                loadRecentSalesHistory();
+                if (currentView === 'inventory') loadInventory({ force: false });
+                originalDb.ref('returns/' + returnId).update({
+                    inventoryCountFlipkart: countUnsold(pickupsCache.flipkart.data),
+                    inventoryCountCashify: countUnsold(pickupsCache.cashify.data)
+                }).catch(() => {});
+            } catch (_) {}
+        }, 100);
+
+        setTimeout(() => {
+            fetchPickups('flipkart').catch(() => {});
+            fetchPickups('cashify').catch(() => {});
+        }, 1200);
+
     } catch (e) {
         console.error('Return processing error:', e);
         showToast('Error processing return. Please try again.', 'error');
     } finally {
-        if (btn) { btn.disabled = false; btn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle"></i> Process Return'; refreshIcons(); }
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = originalBtnHtml || '<i data-lucide="check-circle"></i> Process Return';
+            refreshIcons();
+        }
     }
 }
 
@@ -1339,31 +1700,35 @@ function buildReturnMessage(r) {
 }
 
 async function showReturnSuccessModal(message) {
-    const result = await Swal.fire({
-        title: '✅ Return Processed Successfully',
-        html: `
-            <div style="text-align:left;">
-                <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
-                <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
-            </div>`,
-        showDenyButton: true,
-        showCancelButton: true,
-        confirmButtonText: '📋 Copy Message',
-        denyButtonText: '📱 Open WhatsApp',
-        cancelButtonText: 'Close',
-        confirmButtonColor: '#059669',
-        denyButtonColor: '#25D366',
-        cancelButtonColor: '#64748b',
-        width: 'min(560px, 96vw)'
-    });
-    if (result.isConfirmed) await copyTextToClipboard(message);
-    else if (result.isDenied) openWhatsApp(message);
+    if (!hasSwal()) { copyTextToClipboard(message); return; }
+    try {
+        const result = await Swal.fire({
+            title: '✅ Return Processed Successfully',
+            html: `
+                <div style="text-align:left;">
+                    <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
+                    <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
+                </div>`,
+            showDenyButton: true,
+            showCancelButton: true,
+            confirmButtonText: '📋 Copy Message',
+            denyButtonText: '📱 Open WhatsApp',
+            cancelButtonText: 'Close',
+            confirmButtonColor: '#059669',
+            denyButtonColor: '#25D366',
+            cancelButtonColor: '#64748b',
+            width: 'min(560px, 96vw)'
+        });
+        if (result.isConfirmed) await copyTextToClipboard(message);
+        else if (result.isDenied) openWhatsApp(message);
+    } catch (_) {}
 }
 
 async function copyTextToClipboard(text) {
     try {
         await navigator.clipboard.writeText(text);
         showToast('✅ Message copied to clipboard', 'success');
+        return true;
     } catch (e) {
         const ta = document.createElement('textarea');
         ta.value = text;
@@ -1371,9 +1736,11 @@ async function copyTextToClipboard(text) {
         ta.style.opacity = '0';
         document.body.appendChild(ta);
         ta.select();
-        try { document.execCommand('copy'); showToast('✅ Message copied', 'success'); }
+        let ok = false;
+        try { document.execCommand('copy'); ok = true; showToast('✅ Message copied', 'success'); }
         catch (err) { showToast('Copy failed — please select manually', 'error'); }
         document.body.removeChild(ta);
+        return ok;
     }
 }
 
@@ -1393,21 +1760,19 @@ async function loadReturnsHistory() {
         const fkData = fkSnap.val() || {};
         const cfData = cfSnap.val() || {};
         const candidates = [
-            ...Object.entries(fkData).map(([id, r]) => ({ id, _source: 'flipkart', ...r })),
-            ...Object.entries(cfData).map(([id, r]) => ({ id, _source: 'cashify', ...r }))
-        ].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        const merged = [];
-        for (let offset = 0; offset < candidates.length && merged.length < 30; offset += 30) {
-            const batch = candidates.slice(offset, offset + 30);
-            const originalPickups = await Promise.all(batch.map(r =>
-                r.originalPickupId
-                    ? getDb(r._source).ref('pickups/' + r.originalPickupId).once('value')
-                    : Promise.resolve(null)
-            ));
-            batch.forEach((r, index) => {
-                if (originalPickups[index]?.exists()) merged.push(r);
-            });
-        }
+            ...Object.keys(fkData).map(id => Object.assign({ id, _source: 'flipkart' }, fkData[id])),
+            ...Object.keys(cfData).map(id => Object.assign({ id, _source: 'cashify' }, cfData[id]))
+        ].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 60);
+
+        const knownIds = {
+            flipkart: new Set(Object.keys(pickupsCache.flipkart.data || {})),
+            cashify: new Set(Object.keys(pickupsCache.cashify.data || {}))
+        };
+        const merged = candidates.filter(r => {
+            const set = knownIds[r._source];
+            if (!set || set.size === 0) return true;
+            return !r.originalPickupId || set.has(r.originalPickupId);
+        }).slice(0, 30);
 
         if (!merged.length) {
             container.innerHTML = `<div class="text-center py-8 text-gray-400 text-sm">No returns recorded yet on either platform</div>`;
@@ -1422,6 +1787,7 @@ async function loadReturnsHistory() {
             const returnInfo = r.returnType === 'money'
                 ? `💵 ₹${(Number(r.returnAmount) || 0).toLocaleString('en-IN')} returned`
                 : `📱 ${escapeHtml(r.exchangeModel || '—')} (${r.exchangePhoneSource === 'cashify' ? 'Cashify' : 'Flipkart'})`;
+            const safeId = String(r.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
             html += `
                 <div class="return-history-item">
                     <div class="flex items-start justify-between gap-2 mb-1">
@@ -1437,7 +1803,7 @@ async function loadReturnsHistory() {
                     <div class="text-xs text-gray-600 mt-1">${returnInfo}</div>
                     <div class="flex items-center justify-between mt-2 pt-2 border-t border-gray-100">
                         <span class="text-[10px] text-gray-400">Original Sale: ₹${(Number(r.originalSalePrice) || 0).toLocaleString('en-IN')}</span>
-                        <button onclick="viewReturnMessage('${src}', '${r.id}')" class="text-[10px] text-indigo-600 font-semibold hover:underline">View / Resend Message</button>
+                        <button onclick="viewReturnMessage('${src}', '${safeId}')" class="text-[10px] text-indigo-600 font-semibold hover:underline">View / Resend Message</button>
                     </div>
                 </div>`;
         });
@@ -1453,7 +1819,7 @@ async function loadReturnsHistory() {
 async function viewReturnMessage(source, returnId) {
     if (!isStillAuthorized()) { showLoginOverlay(); return; }
     try {
-        const snap = await getDb(source).ref('returns/' + returnId).once('value');
+        const snap = await withTimeout(getDb(source).ref('returns/' + returnId).once('value'), 8000);
         const record = snap.val();
         if (!record) { showToast('Return record not found', 'error'); return; }
         await showReturnSuccessModal(buildReturnMessage(record));
@@ -1638,6 +2004,7 @@ function injectLoginUI() {
     const overlay = document.createElement('div');
     overlay.id = 'salesLoginOverlay';
     overlay.className = 'sales-login-overlay';
+    overlay.style.display = 'none';
     overlay.innerHTML = `
         <div class="sales-login-box">
             <div class="sales-login-logo">🛒</div>
@@ -1666,7 +2033,7 @@ function injectLoginUI() {
 }
 
 // ================================================================
-// ACCESS CONTROL — Immediate Revoke + Per-Action Verify
+// ACCESS CONTROL — Immediate Revoke + Fault-Tolerant Verify
 // ================================================================
 function verifySalesAccess(userData) {
     if (!userData) return { ok: false, reason: 'not_found' };
@@ -1675,14 +2042,10 @@ function verifySalesAccess(userData) {
 
     const role = userData.role || 'agent';
 
-    // Admins bypass UNLESS explicitly revoked via sales_access: false
     if (role === 'admin') {
-        if (userData.sales_access === false) {
-            return { ok: false, reason: 'no_access' };
-        }
+        if (userData.sales_access === false) return { ok: false, reason: 'no_access' };
         return { ok: true };
     }
-
     if (userData.sales_access === true) return { ok: true };
     return { ok: false, reason: 'no_access' };
 }
@@ -1697,36 +2060,38 @@ function startAccessListener() {
 
     accessListenerRef = flipkartDb.ref('users/' + uname);
     accessListenerRef.on('value', snapshot => {
-        console.log('[SalesManager] 🔔 Access listener fired for', uname, '→', snapshot.val());
+        const applyUpdate = (data) => {
+            const access = verifySalesAccess(data);
+            if (!access.ok) {
+                let reason = 'Your Sales Management access has been revoked by admin.';
+                if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
+                if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
+                forceLogout(reason);
+                if (access.reason === 'force_logout') {
+                    setTimeout(() => {
+                        flipkartDb.ref('users/' + uname + '/forceLogout').remove().catch(() => {});
+                    }, 500);
+                }
+                return;
+            }
+            lastAccessVerifiedAt = Date.now();
+            currentSalesUser.name = data.name || currentSalesUser.username;
+            currentSalesUser.role = data.role || 'agent';
+            currentSalesUser.isAdmin = (data.role || 'agent') === 'admin';
+            try { localStorage.setItem(SALES_AUTH_KEY, JSON.stringify(currentSalesUser)); } catch (_) {}
+        };
 
         if (!snapshot.exists()) {
-            forceLogout('Your account has been removed.');
+            if (!navigator.onLine) return;
+            withTimeout(flipkartDb.ref('users/' + uname).once('value'), 6000).then(fresh => {
+                if (!fresh.exists()) forceLogout('Your account has been removed.');
+                else applyUpdate(fresh.val());
+            }).catch(() => {});
             return;
         }
-
-        const data = snapshot.val();
-        const access = verifySalesAccess(data);
-
-        if (!access.ok) {
-            let reason = 'Your Sales Management access has been revoked by admin.';
-            if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
-            if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
-
-            forceLogout(reason);
-
-            if (access.reason === 'force_logout') {
-                setTimeout(() => {
-                    flipkartDb.ref('users/' + uname + '/forceLogout').remove().catch(() => {});
-                }, 500);
-            }
-            return;
-        }
-
-        currentSalesUser.name = data.name || currentSalesUser.username;
-        currentSalesUser.role = data.role || 'agent';
-        currentSalesUser.isAdmin = (data.role || 'agent') === 'admin';
+        applyUpdate(snapshot.val());
     }, err => {
-        console.error('[SalesManager] ❌ Access listener error:', err);
+        console.warn('[SalesManager] Access listener error (ignored):', err && err.message);
     });
 }
 
@@ -1740,17 +2105,19 @@ function stopAccessListener() {
 function forceLogout(reason) {
     console.log('[SalesManager] 🚪 forceLogout called:', reason);
     accessRevokedFlag = true;
+    lastAccessVerifiedAt = 0;
     stopAccessListener();
     currentSalesUser = null;
     try { localStorage.removeItem(SALES_AUTH_KEY); } catch (_) {}
     document.querySelector('.sales-user-badge')?.remove();
     try { Swal.close(); } catch (_) {}
-    try { closeSellModal?.(); } catch (_) {}
-    try { closeDetailModal?.(); } catch (_) {}
-    try { cancelReturnSelection?.(); } catch (_) {}
+    try { closeSellModal(); } catch (_) {}
+    try { closeDetailModal(); } catch (_) {}
+    try { cancelReturnSelection(); } catch (_) {}
     showLoginOverlay();
 
     setTimeout(() => {
+        if (!hasSwal()) { showToast(reason || 'Session ended', 'error', 4000); return; }
         Swal.fire({
             icon: 'warning',
             title: '🔒 Session Ended',
@@ -1758,7 +2125,7 @@ function forceLogout(reason) {
             confirmButtonColor: '#dc2626',
             allowOutsideClick: false,
             allowEscapeKey: false
-        });
+        }).catch(() => {});
     }, 100);
 }
 
@@ -1767,16 +2134,12 @@ function isStillAuthorized() {
 }
 
 async function assertSalesAccess() {
-    if (!isStillAuthorized()) {
-        showLoginOverlay();
-        return false;
-    }
+    if (!isStillAuthorized()) { showLoginOverlay(); return false; }
+    if (Date.now() - lastAccessVerifiedAt < 60000) return true;
+
     try {
-        const snap = await flipkartDb.ref('users/' + currentSalesUser.username).once('value');
-        if (!snap.exists()) {
-            forceLogout('Your account has been removed.');
-            return false;
-        }
+        const snap = await withTimeout(flipkartDb.ref('users/' + currentSalesUser.username).once('value'), 6000);
+        if (!snap.exists()) { forceLogout('Your account has been removed.'); return false; }
         const access = verifySalesAccess(snap.val());
         if (!access.ok) {
             let reason = 'Sales Management access revoked.';
@@ -1785,11 +2148,11 @@ async function assertSalesAccess() {
             forceLogout(reason);
             return false;
         }
+        lastAccessVerifiedAt = Date.now();
         return true;
     } catch (e) {
-        console.error('Access check failed:', e);
-        showToast('Could not verify access. Check network.', 'error');
-        return false;
+        console.warn('[SalesManager] Access check failed (offline tolerant):', e && e.message);
+        return true;
     }
 }
 
@@ -1812,7 +2175,7 @@ async function attemptSalesLogin() {
     if (btn) { btn.disabled = true; btn.textContent = 'Logging in…'; }
 
     try {
-        const snap = await flipkartDb.ref('users/' + username).once('value');
+        const snap = await withTimeout(flipkartDb.ref('users/' + username).once('value'), 10000);
         if (!snap.exists()) {
             if (errEl) { errEl.textContent = 'User not found'; errEl.style.display = 'block'; }
             return;
@@ -1844,6 +2207,7 @@ async function attemptSalesLogin() {
         };
         try { localStorage.setItem(SALES_AUTH_KEY, JSON.stringify(currentSalesUser)); } catch (_) {}
         accessRevokedFlag = false;
+        lastAccessVerifiedAt = Date.now();
         startAccessListener();
 
         hideLoginOverlay();
@@ -1865,14 +2229,13 @@ function hideLoginOverlay() {
 
 function showLoginOverlay() {
     const o = document.getElementById('salesLoginOverlay');
-    if (o) {
-        o.style.display = 'flex';
-        const u = document.getElementById('salesLoginUsername');
-        const p = document.getElementById('salesLoginPassword');
-        if (u) u.value = '';
-        if (p) p.value = '';
-        setTimeout(() => u?.focus(), 200);
-    }
+    if (!o) return;
+    o.style.display = 'flex';
+    const u = document.getElementById('salesLoginUsername');
+    const p = document.getElementById('salesLoginPassword');
+    if (u) u.value = '';
+    if (p) p.value = '';
+    setTimeout(() => u?.focus(), 200);
 }
 
 function showUserBadge() {
@@ -1897,6 +2260,7 @@ function showUserBadge() {
 function logoutSalesUser() {
     stopAccessListener();
     accessRevokedFlag = false;
+    lastAccessVerifiedAt = 0;
     currentSalesUser = null;
     try { localStorage.removeItem(SALES_AUTH_KEY); } catch (_) {}
     document.querySelector('.sales-user-badge')?.remove();
@@ -1905,53 +2269,83 @@ function logoutSalesUser() {
 }
 
 function initAppAfterLogin() {
-    loadInventory();
+    if (pickupsCache[currentSource].data) {
+        inventoryList = buildInventoryList(pickupsCache[currentSource].data, currentSource);
+        applySearch();
+        updateStats(pickupsCache[currentSource].data);
+    }
+    loadInventory({ force: false });
     loadRecentSalesHistory();
     refreshIcons();
+
+    setTimeout(() => prefetchSourceData('flipkart'), 300);
+    setTimeout(() => prefetchSourceData('cashify'), 900);
 }
 
 async function checkSalesSession() {
+    let parsed = null;
     try {
         const stored = localStorage.getItem(SALES_AUTH_KEY);
         if (!stored) return false;
-        const parsed = JSON.parse(stored);
+        parsed = JSON.parse(stored);
         if (!parsed || !parsed.username) return false;
+    } catch (_) { return false; }
 
-        const snap = await flipkartDb.ref('users/' + parsed.username).once('value');
-        if (!snap.exists()) return false;
-        const userData = snap.val();
-        const access = verifySalesAccess(userData);
-        if (!access.ok) return false;
+    currentSalesUser = {
+        username: parsed.username,
+        name: parsed.name || parsed.username,
+        role: parsed.role || 'agent',
+        isAdmin: parsed.role === 'admin'
+    };
+    accessRevokedFlag = false;
+    startAccessListener();
 
-        currentSalesUser = {
-            username: parsed.username,
-            name: userData.name || parsed.username,
-            role: userData.role || 'agent',
-            isAdmin: (userData.role || 'agent') === 'admin'
-        };
-        accessRevokedFlag = false;
-        startAccessListener();
-        return true;
-    } catch (e) {
-        console.warn('Session check failed:', e);
-        return false;
-    }
+    setTimeout(async () => {
+        if (!currentSalesUser || accessRevokedFlag) return;
+        if (Date.now() - lastAccessVerifiedAt < 5000) return;
+        try {
+            const snap = await withTimeout(flipkartDb.ref('users/' + currentSalesUser.username).once('value'), 8000);
+            if (!snap.exists()) {
+                if (navigator.onLine) forceLogout('Your account has been removed.');
+                return;
+            }
+            const access = verifySalesAccess(snap.val());
+            if (!access.ok) {
+                let reason = 'Your Sales Management access has been revoked by admin.';
+                if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
+                if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
+                forceLogout(reason);
+            } else {
+                lastAccessVerifiedAt = Date.now();
+            }
+        } catch (_) {}
+    }, 1200);
+
+    return true;
 }
 
 // ================================================================
 // SALE WHATSAPP MESSAGE
 // ================================================================
-
-async function getSourceInventoryCount(source) {
-    const snap = await getDb(source).ref('pickups').once('value');
-    const data = snap.val() || {};
-    let count = 0;
-    Object.values(data).forEach(item => {
-        if (item && item.status === 'pickup' && !item.sold) count++;
-    });
-    return count;
+async function getSourceInventoryCount(source, force = false) {
+    const data = await getPickups(source, force);
+    return countUnsold(data);
 }
 
+/**
+ * Build the WhatsApp sale message.
+ *
+ * Unchanged format — only the FINAL totals block differs:
+ *   • Selling a Flipkart order pickup:
+ *       📦 Flipkart Inventory: X units
+ *       📦 Outside Inventory: Y units
+ *       📊 Total: (X+Y) units
+ *   • Selling an Outside Inventory phone (approved from outside_pickups):
+ *       📦 Outside Inventory: Y units
+ *       📦 Flipkart Inventory: X units
+ *       📊 Total: (X+Y) units
+ *   • Selling a Cashify phone: unchanged "Remaining Cashify Stock".
+ */
 function buildSaleMessage(item, salePrice, source, inventoryCount) {
     const sourceLabel = source === 'cashify' ? 'CASHIFY' : 'FLIPKART';
     const model = item.phoneModel || '—';
@@ -1985,39 +2379,60 @@ function buildSaleMessage(item, salePrice, source, inventoryCount) {
     if (pickupAgent && pickupAgent !== salesByUname) {
         lines.push(`🚚 Pickup Agent: ${pickupAgent}`);
     }
-    const stockLabel = sourceLabel === 'CASHIFY' ? 'Cashify' : 'Flipkart';
-    lines.push(`📦 Remaining ${stockLabel} Stock: ${inventoryCount} units`);
+    lines.push('━━━━━━━━━━━━━━━━━━━━');
+
+    if (source === 'flipkart') {
+        // Compute current Flipkart vs Outside breakdown from cache
+        // (the just-sold phone is already marked `sold:true` in cache, so
+        // it's naturally excluded from these "remaining" counts)
+        const breakdown = getFlipkartInventoryBreakdown(pickupsCache.flipkart.data);
+        const soldFromOutside = isOutsidePickupItem(item);
+
+        if (soldFromOutside) {
+            lines.push(`📦 Outside Inventory: ${breakdown.outside} units`);
+            lines.push(`📦 Flipkart Inventory: ${breakdown.flipkart} units`);
+        } else {
+            lines.push(`📦 Flipkart Inventory: ${breakdown.flipkart} units`);
+            lines.push(`📦 Outside Inventory: ${breakdown.outside} units`);
+        }
+        lines.push(`📊 Total: ${breakdown.total} units`);
+    } else {
+        // Cashify source — keep existing single-line stock format
+        lines.push(`📦 Remaining Cashify Stock: ${inventoryCount} units`);
+    }
     lines.push('━━━━━━━━━━━━━━━━━━━━');
 
     return lines.join('\n');
 }
 
 async function showSaleSuccessModal(message) {
-    const result = await Swal.fire({
-        title: '✅ Sale Recorded!',
-        html: `
-            <div style="text-align:left;">
-                <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
-                <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
-            </div>`,
-        showDenyButton: true,
-        showCancelButton: true,
-        confirmButtonText: '📋 Copy Message',
-        denyButtonText: '📱 Open WhatsApp',
-        cancelButtonText: 'Close',
-        confirmButtonColor: '#059669',
-        denyButtonColor: '#25D366',
-        cancelButtonColor: '#64748b',
-        width: 'min(560px, 96vw)'
-    });
-    if (result.isConfirmed) await copyTextToClipboard(message);
-    else if (result.isDenied) openWhatsApp(message);
+    if (!hasSwal()) { await copyTextToClipboard(message); return; }
+    try {
+        const result = await Swal.fire({
+            title: '✅ Sale Recorded!',
+            html: `
+                <div style="text-align:left;">
+                    <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
+                    <pre class="whatsapp-preview-box">${escapeHtml(message)}</pre>
+                </div>`,
+            showDenyButton: true,
+            showCancelButton: true,
+            confirmButtonText: '📋 Copy Message',
+            denyButtonText: '📱 Open WhatsApp',
+            cancelButtonText: 'Close',
+            confirmButtonColor: '#059669',
+            denyButtonColor: '#25D366',
+            cancelButtonColor: '#64748b',
+            width: 'min(560px, 96vw)'
+        });
+        if (result.isConfirmed) await copyTextToClipboard(message);
+        else if (result.isDenied) openWhatsApp(message);
+    } catch (_) {}
 }
 
 // ================================================================
-// RECENT SALES HISTORY (last 7, both platforms)
+// RECENT SALES HISTORY
 // ================================================================
-
 function injectRecentHistoryUI() {
     if (document.getElementById('smHistoryWrap')) return;
     const mainContainer = document.querySelector('.max-w-6xl');
@@ -2029,7 +2444,7 @@ function injectRecentHistoryUI() {
     wrap.innerHTML = `
         <div class="sm-history-head">
             <h3>🕒 Recent Sales History <span style="font-size:11px;font-weight:600;color:#6366f1;">(Last 7)</span></h3>
-            <button onclick="loadRecentSalesHistory()">🔄 Refresh</button>
+            <button onclick="loadRecentSalesHistory(true)">🔄 Refresh</button>
         </div>
         <div class="sm-history-body" id="smHistoryBody">
             <div class="sm-history-empty">Loading…</div>
@@ -2038,37 +2453,29 @@ function injectRecentHistoryUI() {
     mainContainer.appendChild(wrap);
 }
 
-async function loadRecentSalesHistory() {
+async function loadRecentSalesHistory(force = false) {
     if (!currentSalesUser) return;
     const body = document.getElementById('smHistoryBody');
     if (!body) return;
 
     try {
-        const [fkSnap, cfSnap] = await Promise.all([
-            flipkartDb.ref('pickups').once('value'),
-            cashifyDb.ref('pickups').once('value')
+        const [fk, cf] = await Promise.all([
+            getPickups('flipkart', force),
+            getPickups('cashify', force)
         ]);
-        const fk = fkSnap.val() || {};
-        const cf = cfSnap.val() || {};
 
         const isSold = (item) => item && item.sold === true && item.status === 'pickup';
+        const all = [];
+        for (const id in fk) if (isSold(fk[id])) all.push(Object.assign({ id, _source: 'flipkart' }, fk[id]));
+        for (const id in cf) if (isSold(cf[id])) all.push(Object.assign({ id, _source: 'cashify' }, cf[id]));
 
-        const fkSold = Object.entries(fk)
-            .filter(([_, item]) => isSold(item))
-            .map(([id, item]) => ({ ...item, id, _source: 'flipkart' }));
-        const cfSold = Object.entries(cf)
-            .filter(([_, item]) => isSold(item))
-            .map(([id, item]) => ({ ...item, id, _source: 'cashify' }));
+        all.sort((a, b) => {
+            const ta = new Date(a.saleTimestamp || 0).getTime() || 0;
+            const tb = new Date(b.saleTimestamp || 0).getTime() || 0;
+            return tb - ta;
+        });
 
-        const all = [...fkSold, ...cfSold]
-            .sort((a, b) => {
-                const ta = new Date(a.saleTimestamp || 0).getTime() || 0;
-                const tb = new Date(b.saleTimestamp || 0).getTime() || 0;
-                return tb - ta;
-            })
-            .slice(0, 7);
-
-        renderRecentSalesHistory(all);
+        renderRecentSalesHistory(all.slice(0, 7));
     } catch (e) {
         console.error('Recent sales load error:', e);
         body.innerHTML = '<div class="sm-history-empty">Failed to load recent sales</div>';
@@ -2126,16 +2533,15 @@ function renderRecentSalesHistory(sales) {
 }
 
 async function copySaleMessageForHistory(source, id) {
-    if (!(await assertSalesAccess())) return;
+    if (!isStillAuthorized()) { showLoginOverlay(); return; }
     try {
-        const snap = await getDb(source).ref('pickups/' + id).once('value');
-        const item = snap.val();
+        let item = pickupsCache[source].data && pickupsCache[source].data[id];
         if (!item) {
-            showToast('Sale not found', 'error');
-            return;
+            const snap = await withTimeout(getDb(source).ref('pickups/' + id).once('value'), 8000);
+            item = snap.val();
         }
-        let count = 0;
-        try { count = await getSourceInventoryCount(source); } catch (_) {}
+        if (!item) { showToast('Sale not found', 'error'); return; }
+        const count = countUnsold(pickupsCache[source].data);
         const msg = buildSaleMessage(item, item.salePrice || 0, source, count);
         await copyTextToClipboard(msg);
     } catch (e) {
@@ -2148,10 +2554,15 @@ async function copySaleMessageForHistory(source, id) {
 // INIT
 // ================================================================
 document.addEventListener('DOMContentLoaded', async () => {
+    const bootTs = Date.now();
+
+    hydrateInventoryFromLS();
+    hydrateOverheadFromLS();
+
     setupOfflineDetection();
     injectLoginUI();
     injectRecentHistoryUI();
-    refreshIcons();
+    refreshIconsNow();
 
     document.querySelectorAll('#sourceTabs .source-tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.source === currentSource);
@@ -2163,46 +2574,48 @@ document.addEventListener('DOMContentLoaded', async () => {
         hideLoginOverlay();
         showUserBadge();
         initAppAfterLogin();
-        showToast('👋 Welcome back, ' + currentSalesUser.name, 'info', 2000);
     } else {
         showLoginOverlay();
+        if (pickupsCache[currentSource].data) {
+            inventoryList = buildInventoryList(pickupsCache[currentSource].data, currentSource);
+            applySearch();
+            updateStats(pickupsCache[currentSource].data);
+        }
     }
 
-    // FALLBACK — verify access every 15s (safety net if listener fails)
     if (fallbackCheckInterval) clearInterval(fallbackCheckInterval);
     fallbackCheckInterval = setInterval(async () => {
         if (document.hidden) return;
         if (!currentSalesUser) return;
         if (accessRevokedFlag) return;
+        if (!navigator.onLine) return;
+        if (Date.now() - lastAccessVerifiedAt < 60000) return;
 
         try {
-            const snap = await flipkartDb.ref('users/' + currentSalesUser.username).once('value');
-            if (!snap.exists()) {
-                forceLogout('Your account has been removed.');
-                return;
-            }
+            const snap = await withTimeout(flipkartDb.ref('users/' + currentSalesUser.username).once('value'), 8000);
+            if (!snap.exists()) { forceLogout('Your account has been removed.'); return; }
             const access = verifySalesAccess(snap.val());
             if (!access.ok) {
                 let reason = 'Your Sales Management access has been revoked by admin.';
                 if (access.reason === 'inactive') reason = 'Your account has been deactivated.';
                 if (access.reason === 'force_logout') reason = 'You have been logged out by admin.';
-                console.log('[SalesManager] 🔒 Fallback check detected revocation:', access.reason);
                 forceLogout(reason);
+            } else {
+                lastAccessVerifiedAt = Date.now();
             }
-        } catch (e) {
-            console.warn('[SalesManager] Fallback access check failed:', e);
-        }
-    }, 15000);
+        } catch (_) {}
+    }, 20000);
 
     setInterval(() => {
         if (document.hidden) return;
         if (!isStillAuthorized()) return;
-        if (currentView === 'inventory') loadInventory();
+        if (!navigator.onLine) return;
+        if (currentView === 'inventory') loadInventory({ force: false });
         else if (currentView === 'returns') loadReturnsHistory();
-        loadRecentSalesHistory();
+        loadRecentSalesHistory(false);
     }, 60000);
 
-    console.log('[SalesManager] ✅ v3.2 initialized — revoke listener + 15s fallback');
+    console.log(`[SalesManager] ✅ v4.1 initialized in ${Date.now() - bootTs}ms — cache-first, fault-tolerant, Flipkart/Outside breakdown`);
 });
 
 // ---------- MODAL OUTSIDE-CLICK + ESC ----------
@@ -2210,7 +2623,9 @@ const sellModalEl = document.getElementById('sellModal');
 if (sellModalEl) sellModalEl.addEventListener('click', function (e) { if (e.target === this) closeSellModal(); });
 const detailModalEl = document.getElementById('detailModal');
 if (detailModalEl) detailModalEl.addEventListener('click', function (e) { if (e.target === this) closeDetailModal(); });
-document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeSellModal(); closeDetailModal(); } });
+document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { closeSellModal(); closeDetailModal(); }
+});
 
 // ---------- EXPOSE FOR INLINE HANDLERS ----------
 window.switchView = switchView;
@@ -2242,5 +2657,18 @@ window.logoutSalesUser = logoutSalesUser;
 window.loadRecentSalesHistory = loadRecentSalesHistory;
 window.copySaleMessageForHistory = copySaleMessageForHistory;
 
+// ---------- PAGE-LIFECYCLE HYGIENE ----------
+window.addEventListener('beforeunload', () => {
+    stopAccessListener();
+    if (fallbackCheckInterval) clearInterval(fallbackCheckInterval);
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && isStillAuthorized() && navigator.onLine) {
+        if (currentView === 'inventory') loadInventory({ force: false });
+        loadRecentSalesHistory(false);
+    }
+});
+
 // Version log for cache verification
-console.log('[SalesManager] ✅ v3.2 loaded — inventory + returns only');
+console.log('[SalesManager] ✅ v4.1 loaded — Flipkart + Outside breakdown in WhatsApp sale message');
