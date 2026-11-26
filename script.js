@@ -191,6 +191,32 @@ function decorateForSearch(item) {
     return item;
 }
 
+function levenshteinDistance(a, b, limit = 2) {
+    if (a === b) return 0;
+    if (!a || !b || Math.abs(a.length - b.length) > limit) return limit + 1;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        const curr = [i];
+        let rowMin = i;
+        for (let j = 1; j <= b.length; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+            rowMin = Math.min(rowMin, curr[j]);
+        }
+        if (rowMin > limit) return limit + 1;
+        prev = curr;
+    }
+    return prev[b.length];
+}
+
+function fuzzyWordMatch(queryToken, candidate) {
+    if (!queryToken || !candidate) return false;
+    if (candidate.startsWith(queryToken) || queryToken.startsWith(candidate)) return true;
+    if (queryToken.length < 4 || candidate.length < 4) return false;
+    const maxDistance = queryToken.length >= 6 ? 2 : 1;
+    return levenshteinDistance(queryToken, candidate, maxDistance) <= maxDistance;
+}
+
 function tokenMatchesBlob(tok, blob, compactBlob) {
     if (!tok) return false;
     if (blob.includes(tok)) return true;
@@ -204,6 +230,12 @@ function tokenMatchesBlob(tok, blob, compactBlob) {
             const aCompact = aNorm.replace(/\s+/g, '');
             if (aCompact.length >= 3 && compactBlob.includes(aCompact)) return true;
         }
+    }
+    const words = blob.split(' ').filter(Boolean);
+    if (words.some(word => fuzzyWordMatch(tok, word))) return true;
+    for (const [brand, brandAliases] of Object.entries(BRAND_ALIASES)) {
+        if (!fuzzyWordMatch(tok, brand)) continue;
+        if (brandAliases.some(alias => blob.includes(normalizeSearchText(alias)))) return true;
     }
     return false;
 }
@@ -385,6 +417,38 @@ function countUnsold(data) {
         if (it && it.status === 'pickup' && !it.sold) n++;
     }
     return n;
+}
+
+function getInventorySnapshot(override = null) {
+    const sources = {
+        flipkart: pickupsCache.flipkart.data || {},
+        cashify: pickupsCache.cashify.data || {}
+    };
+    const countSource = (source) => {
+        let regular = 0, outside = 0;
+        const data = sources[source] || {};
+        const ids = new Set(Object.keys(data));
+        if (override && override.source === source && override.id) ids.add(String(override.id));
+        for (const id of ids) {
+            let item = data[id] || null;
+            if (override && override.source === source && String(override.id) === String(id)) {
+                item = Object.assign({}, item || {}, override.patch || {});
+            }
+            if (!item || item.status !== 'pickup' || item.sold === true) continue;
+            if (source === 'flipkart' && isOutsidePickupItem(item)) outside++;
+            else regular++;
+        }
+        return { regular, outside, total: regular + outside };
+    };
+    const fk = countSource('flipkart');
+    const cf = countSource('cashify');
+    return {
+        flipkartRegular: fk.regular,
+        outside: fk.outside,
+        flipkartTotal: fk.total,
+        cashify: cf.total,
+        capturedAt: Date.now()
+    };
 }
 
 function fetchUsers(source) {
@@ -654,18 +718,11 @@ function updateLastUpdatedLabel() {
 
 function applySearch() {
     const searchInput = document.getElementById('inventorySearch');
-    const raw = (searchInput ? searchInput.value : '').trim().toLowerCase();
+    const raw = (searchInput ? searchInput.value : '').trim();
     if (!raw) {
         filteredInventory = inventoryList.slice();
     } else {
-        filteredInventory = inventoryList.filter(item => {
-            const orderId = String(item.orderId || item.id || '').toLowerCase();
-            const model = String(item.phoneModel || '').toLowerCase();
-            const imei = String(item.imei || '').toLowerCase();
-            const imei2 = String(item.imei2 || '').toLowerCase();
-            const cust = String(item.customerName || '').toLowerCase();
-            return orderId.includes(raw) || model.includes(raw) || imei.includes(raw) || imei2.includes(raw) || cust.includes(raw);
-        });
+        filteredInventory = inventoryList.filter(item => phoneMatchesQuery(decorateForSearch(item), raw));
     }
     renderInventory();
     const countEl = document.getElementById('inventoryCount');
@@ -881,6 +938,9 @@ async function confirmSell() {
             salesByName: currentSalesUser.name,
             overheadPerPhone: overhead
         };
+        writePayload.inventorySnapshot = getInventorySnapshot({
+            source, id: order.id, patch: writePayload
+        });
 
         if (source === 'flipkart') {
             const commission = calculateCommission(purchase);
@@ -1152,8 +1212,11 @@ async function loadReturnsInventoryCounts() {
         const [fk, cf] = await Promise.all([getPickups('flipkart'), getPickups('cashify')]);
         const fkEl = document.getElementById('flipkartInvCount');
         const cfEl = document.getElementById('cashifyInvCount');
-        if (fkEl) fkEl.textContent = countUnsold(fk);
+        const fkBreakdown = getFlipkartInventoryBreakdown(fk);
+        if (fkEl) fkEl.textContent = fkBreakdown.total;
         if (cfEl) cfEl.textContent = countUnsold(cf);
+        const detailEl = document.getElementById('flipkartInvBreakdown');
+        if (detailEl) detailEl.textContent = `Regular ${fkBreakdown.flipkart} · Outside ${fkBreakdown.outside}`;
     } catch (e) { console.warn('Counts load failed:', e); }
 }
 
@@ -1515,18 +1578,18 @@ async function submitReturn() {
     if (hasSwal()) {
         try {
             const confirm = await Swal.fire({
-                title: 'Confirm Return Processing',
+                title: type === 'exchange' ? 'Confirm Exchange Processing' : 'Confirm Return Processing',
                 html: `
                     <div style="text-align:left;font-size:13px;line-height:1.6;">
                         <div style="margin-bottom:8px;">
-                            <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;background:${originalSource === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${originalSource === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${originalSource === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()} RETURN</span>
+                            <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800;background:${originalSource === 'cashify' ? '#E6FAF6' : '#eef2ff'};color:${originalSource === 'cashify' ? '#0FA88B' : '#4338ca'};border:1px solid ${originalSource === 'cashify' ? '#a7f3d0' : '#c7d2fe'};">${sourceLabel.toUpperCase()} ${type === 'exchange' ? 'EXCHANGE' : 'RETURN'}</span>
                         </div>
                         <p><strong>Order:</strong> ${escapeHtml(original.orderId || original.id)}</p>
                         <p><strong>Model:</strong> ${escapeHtml(original.phoneModel || '—')}</p>
                         <p><strong>IMEI:</strong> ${escapeHtml(original.imei || '—')}</p>
                         <p><strong>Original Sale:</strong> ₹${originalSalePrice.toLocaleString('en-IN')}</p>
                         <hr style="margin:8px 0;">
-                        <p><strong>Return Date:</strong> ${escapeHtml(returnDate)}</p>
+                        <p><strong>${type === 'exchange' ? 'Exchange Date' : 'Return Date'}:</strong> ${escapeHtml(returnDate)}</p>
                         ${type === 'money'
                             ? `<p><strong>Return Amount:</strong> ₹${returnAmount.toLocaleString('en-IN')} (Cash to customer)</p>`
                             : `<p><strong>Exchange Phone:</strong> ${escapeHtml(exchangePhone.phoneModel)} (${escapeHtml(exchangePhone.imei)})</p>
@@ -1537,7 +1600,7 @@ async function submitReturn() {
                 showCancelButton: true,
                 confirmButtonColor: '#dc2626',
                 cancelButtonColor: '#64748b',
-                confirmButtonText: '✅ Yes, Process Return',
+                confirmButtonText: type === 'exchange' ? '✅ Yes, Process Exchange' : '✅ Yes, Process Return',
                 cancelButtonText: 'Cancel'
             });
             if (!confirm.isConfirmed) return;
@@ -1627,10 +1690,18 @@ async function submitReturn() {
             patchPickupCache(exchangePhone._source, exchangePhone.id, exchangePayload);
         }
 
-        const fkCount = countUnsold(pickupsCache.flipkart.data);
-        const cfCount = countUnsold(pickupsCache.cashify.data);
-        returnRecord.inventoryCountFlipkart = fkCount;
-        returnRecord.inventoryCountCashify = cfCount;
+        returnRecord.inventorySnapshot = getInventorySnapshot();
+        returnRecord.inventoryCountFlipkart = returnRecord.inventorySnapshot.flipkartTotal;
+        returnRecord.inventoryCountCashify = returnRecord.inventorySnapshot.cashify;
+        try {
+            await originalDb.ref('returns/' + returnId).update({
+                inventorySnapshot: returnRecord.inventorySnapshot,
+                inventoryCountFlipkart: returnRecord.inventoryCountFlipkart,
+                inventoryCountCashify: returnRecord.inventoryCountCashify
+            });
+        } catch (snapshotSaveError) {
+            console.warn('[SalesManager] Return completed, but inventory snapshot metadata could not be saved:', snapshotSaveError);
+        }
 
         const message = buildReturnMessage(returnRecord);
 
@@ -1638,7 +1709,7 @@ async function submitReturn() {
         allExchangeInventoryBoth = [];
         returnsDataLoaded = false;
         cancelReturnSelection();
-        showToast('✅ Return processed', 'success', 2200);
+        showToast(type === 'exchange' ? '✅ Exchange processed' : '✅ Return processed', 'success', 2200);
         showReturnSuccessModal(message).catch(() => {});
 
         setTimeout(async () => {
@@ -1650,10 +1721,6 @@ async function submitReturn() {
                 loadReturnsInventoryCounts();
                 loadRecentSalesHistory();
                 if (currentView === 'inventory') loadInventory({ force: false });
-                originalDb.ref('returns/' + returnId).update({
-                    inventoryCountFlipkart: countUnsold(pickupsCache.flipkart.data),
-                    inventoryCountCashify: countUnsold(pickupsCache.cashify.data)
-                }).catch(() => {});
             } catch (_) {}
         }, 100);
 
@@ -1676,26 +1743,36 @@ async function submitReturn() {
 
 // ---------- WHATSAPP MESSAGE ----------
 function buildReturnMessage(r) {
+    const isExchange = r.returnType === 'exchange';
     const L = [];
-    L.push('🔄 *RETURN*');
+    L.push(isExchange ? '🔁 *EXCHANGE*' : '🔄 *RETURN*');
     L.push('');
-    L.push(`📋 Order ID: ${r.originalOrderId}`);
-    L.push(`📱 Model: ${r.originalModel}`);
+    L.push(`📋 Order ID: ${r.originalOrderId || '—'}`);
+    L.push(`📱 Model: ${r.originalModel || '—'}`);
     L.push(`💰 Sale Amount: ₹${(Number(r.originalSalePrice) || 0).toLocaleString('en-IN')}`);
-    L.push(`📅 Sale Date: ${r.originalSaleDate}`);
+    L.push(`📅 Sale Date: ${r.originalSaleDate || '—'}`);
     L.push('');
-    L.push(`📅 Return Date: ${r.returnDate}`);
-    L.push('');
-    if (r.returnType === 'money') {
-        L.push(`💵 Return Amount: ₹${(Number(r.returnAmount) || 0).toLocaleString('en-IN')}`);
-    } else {
+    if (isExchange) {
+        L.push(`📅 Exchange Date: ${r.returnDate || '—'}`);
         L.push(`📱 Exchange Phone: ${r.exchangeModel || '—'}`);
+        L.push(`🔖 Exchange IMEI: ${r.exchangeImei || '—'}`);
         L.push(`📦 From: ${r.exchangePhoneSource === 'cashify' ? 'Cashify' : 'Flipkart'} Inventory`);
+    } else {
+        L.push(`📅 Return Date: ${r.returnDate || '—'}`);
+        L.push(`💵 Return Amount: ₹${(Number(r.returnAmount) || 0).toLocaleString('en-IN')}`);
     }
     L.push('');
     L.push('📊 *Updated Inventory:*');
-    L.push(`   • Flipkart: ${r.inventoryCountFlipkart} units`);
-    L.push(`   • Cashify: ${r.inventoryCountCashify} units`);
+    const snapshot = r.inventorySnapshot || null;
+    if (snapshot) {
+        L.push(`   • Flipkart (incl. Outside): ${Number(snapshot.flipkartTotal) || 0} units`);
+        L.push(`      - Regular Flipkart: ${Number(snapshot.flipkartRegular) || 0} units`);
+        L.push(`      - Outside Inventory: ${Number(snapshot.outside) || 0} units`);
+        L.push(`   • Cashify: ${Number(snapshot.cashify) || 0} units`);
+    } else {
+        L.push(`   • Flipkart: ${Number(r.inventoryCountFlipkart) || 0} units`);
+        L.push(`   • Cashify: ${Number(r.inventoryCountCashify) || 0} units`);
+    }
     return L.join('\n');
 }
 
@@ -1703,7 +1780,7 @@ async function showReturnSuccessModal(message) {
     if (!hasSwal()) { copyTextToClipboard(message); return; }
     try {
         const result = await Swal.fire({
-            title: '✅ Return Processed Successfully',
+            title: message.startsWith('🔁 *EXCHANGE*') ? '✅ Exchange Processed Successfully' : '✅ Return Processed Successfully',
             html: `
                 <div style="text-align:left;">
                     <p style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">WhatsApp Message Preview</p>
@@ -2381,24 +2458,21 @@ function buildSaleMessage(item, salePrice, source, inventoryCount) {
     }
     lines.push('━━━━━━━━━━━━━━━━━━━━');
 
+    const snapshot = item.inventorySnapshot || null;
     if (source === 'flipkart') {
-        // Compute current Flipkart vs Outside breakdown from cache
-        // (the just-sold phone is already marked `sold:true` in cache, so
-        // it's naturally excluded from these "remaining" counts)
-        const breakdown = getFlipkartInventoryBreakdown(pickupsCache.flipkart.data);
-        const soldFromOutside = isOutsidePickupItem(item);
-
-        if (soldFromOutside) {
-            lines.push(`📦 Outside Inventory: ${breakdown.outside} units`);
-            lines.push(`📦 Flipkart Inventory: ${breakdown.flipkart} units`);
+        if (snapshot) {
+            lines.push(`📦 Flipkart Inventory: ${Number(snapshot.flipkartRegular) || 0} units`);
+            lines.push(`📦 Outside Inventory: ${Number(snapshot.outside) || 0} units`);
+            lines.push(`📊 Total: ${Number(snapshot.flipkartTotal) || 0} units`);
         } else {
-            lines.push(`📦 Flipkart Inventory: ${breakdown.flipkart} units`);
-            lines.push(`📦 Outside Inventory: ${breakdown.outside} units`);
+            lines.push('📊 Historical stock snapshot: Not recorded for this older sale');
         }
-        lines.push(`📊 Total: ${breakdown.total} units`);
     } else {
-        // Cashify source — keep existing single-line stock format
-        lines.push(`📦 Remaining Cashify Stock: ${inventoryCount} units`);
+        if (snapshot) {
+            lines.push(`📦 Remaining Cashify Stock: ${Number(snapshot.cashify) || 0} units`);
+        } else {
+            lines.push('📊 Historical stock snapshot: Not recorded for this older sale');
+        }
     }
     lines.push('━━━━━━━━━━━━━━━━━━━━');
 
@@ -2541,6 +2615,33 @@ async function copySaleMessageForHistory(source, id) {
             item = snap.val();
         }
         if (!item) { showToast('Sale not found', 'error'); return; }
+
+        // Exchange phones are also stored as zero-price sold inventory entries.
+        // Reuse the original exchange/return record so History Copy matches the
+        // exact EXCHANGE message shown immediately after processing.
+        if (item.soldVia === 'exchange' && item.exchangeForReturnId) {
+            const returnId = item.exchangeForReturnId;
+            let exchangeRecord = null;
+            for (const recordSource of ['flipkart', 'cashify']) {
+                try {
+                    const recordSnap = await withTimeout(
+                        getDb(recordSource).ref('returns/' + returnId).once('value'), 8000
+                    );
+                    if (recordSnap && recordSnap.exists()) {
+                        exchangeRecord = recordSnap.val();
+                        break;
+                    }
+                } catch (_) {}
+            }
+            if (exchangeRecord) {
+                await copyTextToClipboard(buildReturnMessage(exchangeRecord));
+                return;
+            }
+            // If the linked record is unavailable, do not mislabel it as a normal sale.
+            showToast('Exchange record not found; cannot rebuild the original exchange message', 'error');
+            return;
+        }
+
         const count = countUnsold(pickupsCache[source].data);
         const msg = buildSaleMessage(item, item.salePrice || 0, source, count);
         await copyTextToClipboard(msg);
